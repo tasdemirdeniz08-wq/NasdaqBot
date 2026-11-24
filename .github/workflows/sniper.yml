@@ -1,0 +1,64 @@
+name: NasdaqBot (7/24 Bulut)
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: sniper
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-worker.txt
+
+      - name: Bagimliliklari kur
+        run: pip install -r requirements-worker.txt
+
+      - name: Onceki kayitlari yukle
+        uses: actions/cache/restore@v4
+        with:
+          path: NasdaqBot-Yukle/bot1haber/sniper_state.json
+          key: sniper-state-${{ github.run_id }}
+          restore-keys: sniper-state-
+
+      - name: NASDAQ tarama ve 1500$ sanal portfoy
+        working-directory: NasdaqBot-Yukle/bot1haber
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          SNIPER_MIN_SCORE: "90"
+          PAPER_TRADING: "1"
+          PAPER_STATE_FILE: ${{ github.workspace }}/paper_state.json
+        run: python cloud_worker.py
+
+      - name: Kayitlari sakla
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: NasdaqBot-Yukle/bot1haber/sniper_state.json
+          key: sniper-state-${{ github.run_id }}
+
+      - name: Sanal portfoyu repoya kaydet
+        if: always()
+        run: |
+          git config user.name "nasdaq-bot"
+          git config user.email "nasdaq-bot@users.noreply.github.com"
+          git add paper_state.json || true
+          if ! git diff --cached --quiet; then
+            git commit -m "paper state guncellendi"
+            git pull --rebase
+            git push
+          fi
