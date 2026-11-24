@@ -1743,8 +1743,178 @@ def _paper_notify(text):
     except Exception:
         pass
 
+POS_NEWS_WORDS = (
+    "yüksel", "rekor", "büyüme", "kâr", "kar artış", "onay", "anlaşma", "hedef fiyat yüksel", "al tavsiyesi",
+    "ralli", "güçlü bilanço", "beklentiyi aştı", "beat", "surge", "rally", "upgrade", "record", "growth", "soar", "bullish", "partnership", "breakout"
+)
+NEG_NEWS_WORDS = (
+    "düşüş", "çöküş", "zarar", "soruşturma", "dava", "ceza", "sat tavsiyesi", "hedef fiyat düşür", "beklenti altı",
+    "işten çıkarma", "uyarı", "risk", "crash", "drop", "miss", "downgrade", "lawsuit", "probe", "cut", "plunge", "bearish", "recall", "fine"
+)
+
+def _score_headline_sentiment(text):
+    t = (text or "").lower()
+    pos = sum(1 for w in POS_NEWS_WORDS if w in t)
+    neg = sum(1 for w in NEG_NEWS_WORDS if w in t)
+    if pos > neg:
+        return 1, "POZİTİF 🟢"
+    if neg > pos:
+        return -1, "NEGATİF 🔴"
+    return 0, "NÖTR ⚪"
+
+def fetch_nasdaq_news_headlines(limit=10):
+    """NASDAQ / Wall Street / ABD teknoloji hisseleri için güncel Türkçe haberleri çeker."""
+    import requests, xml.etree.ElementTree as ET
+    feeds = [
+        ("https://news.google.com/rss/search?q=Nasdaq+OR+%22Nasdaq+100%22&hl=tr&gl=TR&ceid=TR:tr", "NASDAQ"),
+        ("https://news.google.com/rss/search?q=NVIDIA+OR+Apple+OR+Tesla+OR+Microsoft+hisse&hl=tr&gl=TR&ceid=TR:tr", "NASDAQ HİSSE"),
+        ("https://news.google.com/rss/search?q=%22Wall+Street%22+OR+Fed+faiz+OR+ABD+borsa&hl=tr&gl=TR&ceid=TR:tr", "WALL STREET"),
+    ]
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    items = []
+    seen = set()
+    for url, tag in feeds:
+        try:
+            r = requests.get(url, headers=headers, timeout=8)
+            if r.status_code != 200:
+                continue
+            root = ET.fromstring(r.content)
+            for el in root.findall('.//item')[:5]:
+                title_el = el.find('title')
+                link_el = el.find('link')
+                if title_el is None or not title_el.text:
+                    continue
+                title = title_el.text.strip()
+                if title in seen:
+                    continue
+                seen.add(title)
+                s_val, s_lbl = _score_headline_sentiment(title)
+                items.append({
+                    "title": title,
+                    "url": link_el.text.strip() if (link_el is not None and link_el.text) else "",
+                    "source": tag,
+                    "sentiment": s_val,
+                    "sentiment_label": s_lbl
+                })
+        except Exception:
+            continue
+    return items[:limit]
+
+def _analyze_options_flow(symbol):
+    """En yakın vadeli opsiyon zincirinden Call/Put hacmi, Open Interest ve IV verisini analiz eder."""
+    try:
+        import yfinance as yf
+        tk = yf.Ticker(symbol)
+        exps = getattr(tk, "options", None)
+        if not exps:
+            return None
+        exp = exps[0]
+        chain = tk.option_chain(exp)
+        calls, puts = chain.calls, chain.puts
+        if calls is None or puts is None or (calls.empty and puts.empty):
+            return None
+        call_vol = int(calls["volume"].fillna(0).sum()) if "volume" in calls else 0
+        put_vol = int(puts["volume"].fillna(0).sum()) if "volume" in puts else 0
+        call_oi = int(calls["openInterest"].fillna(0).sum()) if "openInterest" in calls else 0
+        put_oi = int(puts["openInterest"].fillna(0).sum()) if "openInterest" in puts else 0
+        iv_vals = calls["impliedVolatility"].dropna() if "impliedVolatility" in calls else []
+        avg_iv = round(float(iv_vals.median()) * 100.0, 1) if len(iv_vals) > 0 else 0.0
+
+        # Hacim yoksa Open Interest kullan
+        num = put_vol if (call_vol + put_vol) >= 100 else put_oi
+        den = call_vol if (call_vol + put_vol) >= 100 else call_oi
+        if den <= 0:
+            return None
+        pc_ratio = round(num / den, 2)
+
+        delta = 0
+        if pc_ratio < 0.65 and den >= 300:
+            delta = 8
+            bias = f"Güçlü CALL akışı (P/C {pc_ratio})"
+        elif pc_ratio < 0.90 and den >= 150:
+            delta = 4
+            bias = f"CALL ağırlıklı (P/C {pc_ratio})"
+        elif pc_ratio > 1.35 and num >= 300:
+            delta = -10
+            bias = f"Yüksek PUT koruması (P/C {pc_ratio})"
+        else:
+            bias = f"Dengeli opsiyon (P/C {pc_ratio})"
+
+        return {
+            "expiry": exp,
+            "call_vol": call_vol,
+            "put_vol": put_vol,
+            "call_oi": call_oi,
+            "put_oi": put_oi,
+            "pc_ratio": pc_ratio,
+            "avg_iv": avg_iv,
+            "score_delta": delta,
+            "summary": f"Opsiyon ({exp}): {bias} | IV %{avg_iv}"
+        }
+    except Exception:
+        return None
+
+def _enrich_with_options_and_news(setups, top_n=15):
+    """En yüksek puanlı adaylara opsiyon zinciri (Call/Put) ve hisse haber duyarlılığı puanı ekler."""
+    import yfinance as yf
+    for s in setups[:top_n]:
+        sym = s["symbol"]
+        extra_notes = []
+        opt = _analyze_options_flow(sym)
+        if opt:
+            s["options"] = opt
+            s["score"] = max(5, min(98, s["score"] + opt["score_delta"]))
+            extra_notes.append(opt["summary"])
+
+        # Hisseye özel son haberler (yfinance)
+        try:
+            tk_news = yf.Ticker(sym).news or []
+            pos_c, neg_c = 0, 0
+            top_headline = ""
+            for n in tk_news[:5]:
+                content = n.get("content", {}) if isinstance(n, dict) else {}
+                title = n.get("title") or content.get("title") or ""
+                if not title:
+                    continue
+                if not top_headline:
+                    top_headline = title
+                sv, _ = _score_headline_sentiment(title)
+                if sv > 0:
+                    pos_c += 1
+                elif sv < 0:
+                    neg_c += 1
+            if pos_c > neg_c:
+                s["score"] = min(98, s["score"] + 6)
+                s["news_bias"] = "POZİTİF"
+                extra_notes.append(f"Haber pozitif ({top_headline[:55]})")
+            elif neg_c > pos_c:
+                s["score"] = max(5, s["score"] - 8)
+                s["news_bias"] = "NEGATİF"
+                extra_notes.append(f"Haber negatif ({top_headline[:55]})")
+            if top_headline:
+                s["latest_news"] = top_headline
+        except Exception:
+            pass
+
+        if extra_notes:
+            s["summary"] = (s.get("summary", "") + " • " + " • ".join(extra_notes)).strip(" •")
+        s["is_sniper"] = s["score"] >= SNIPER_MIN_SCORE
+        if s["is_sniper"]:
+            s["decision"], s["decision_type"] = "🎯 SNIPER AL", "sniper"
+        elif s["score"] >= 75:
+            s["decision"], s["decision_type"] = "GÜÇLÜ AL", "strong_buy"
+        elif s["score"] >= 60:
+            s["decision"], s["decision_type"] = "KADEMELİ AL", "buy"
+        elif s["score"] >= 45:
+            s["decision"], s["decision_type"] = "KIRILIM BEKLE", "wait"
+        else:
+            s["decision"], s["decision_type"] = "DİKKAT / BEKLE", "caution"
+
+    setups.sort(key=lambda x: x["score"], reverse=True)
+    return setups
+
 def _run_full_market_scan():
-    """Sadece NASDAQ 100 + S&P 500 (~515 ABD hissesi) tarar."""
+    """Sadece resmi NASDAQ hisselerini (~500 hisse) tarar; en iyi 15 adaya opsiyon (Call/Put) + haber teyidi ekler."""
     global SNIPER_ALERTS
     setups = []
     yf_assets = _get_us_500_assets()
@@ -1772,6 +1942,7 @@ def _run_full_market_scan():
 
     setups.sort(key=lambda x: x["score"], reverse=True)
     if setups:
+        _enrich_with_options_and_news(setups, top_n=15)
         SETUPS_CACHE["data"] = setups
         SETUPS_CACHE["ts"] = time.time()
         SETUPS_CACHE["scanned_count"] = len(setups)

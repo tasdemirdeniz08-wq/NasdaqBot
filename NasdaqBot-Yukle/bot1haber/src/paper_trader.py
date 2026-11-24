@@ -374,11 +374,18 @@ def _create_plans(st, setups, fx, now, events):
         slots += 1
         exposure += plan["reserved"]
         cat_count[s["category"]] = cat_count.get(s["category"], 0) + 1
+        extra_lines = []
+        if s.get("options") and s["options"].get("summary"):
+            extra_lines.append(f"📊 {s['options']['summary']}")
+        if s.get("latest_news"):
+            nb = s.get("news_bias", "HABER")
+            extra_lines.append(f"📰 {nb}: _{s['latest_news'][:90]}_")
+        extra_txt = ("\n" + "\n".join(extra_lines)) if extra_lines else ""
         events.append(
             f"📝 *YENİ SANAL EMİR PLANI — {s['short']}* ({s['category']} · Skor {s['score']}/100)\n"
             f"Fiyat: `{_fmt(price, cur)}` | Bütçe: `{budget:.2f}$`\n"
             f"Kademe 1: `{_fmt(e1, cur)}` | Kademe 2: `{_fmt(e2, cur)}` | Kırılım: `{_fmt(eb, cur)}`\n"
-            f"🛑 Stop: `{_fmt(stop, cur)}` (-%{stop_frac * 100:.1f}) | 🎯 TP1 `{_fmt(s['tp1'], cur)}` TP2 `{_fmt(s['tp2'], cur)}` TP3 `{_fmt(s['tp3'], cur)}`")
+            f"🛑 Stop: `{_fmt(stop, cur)}` (-%{stop_frac * 100:.1f}) | 🎯 TP1 `{_fmt(s['tp1'], cur)}` TP2 `{_fmt(s['tp2'], cur)}` TP3 `{_fmt(s['tp3'], cur)}`{extra_txt}")
         _log(st, f"PLAN {s['short']} skor {s['score']} bütçe {budget:.0f}$")
 
 

@@ -125,6 +125,24 @@ def main():
         else:
             print(f"Bildirim gönderilemedi: {s['short']} (bir sonraki turda tekrar denenecek)")
 
+    # Yeni NASDAQ / Wall Street haberlerini Telegram'da paylaş (tekrarsız)
+    import hashlib
+    news_items = server.fetch_nasdaq_news_headlines(limit=6)
+    fresh_news = []
+    for n in news_items:
+        nid = "news_" + hashlib.md5(n["title"].encode("utf-8", errors="ignore")).hexdigest()[:12]
+        if nid not in state:
+            fresh_news.append((nid, n))
+    if fresh_news:
+        lines = ["📰 *NASDAQ & WALL STREET HABER AKIŞI*\n"]
+        for _, n in fresh_news[:5]:
+            link_part = f" ([Oku]({n['url']}))" if n.get("url") else ""
+            lines.append(f"• [{n['source']}] {n['sentiment_label']} — {n['title']}{link_part}")
+        if send_telegram("\n".join(lines)):
+            for nid, _ in fresh_news[:5]:
+                state[nid] = now
+            print(f"Haber paketi gönderildi: {min(len(fresh_news), 5)} haber")
+
     # Eski kayıtları temizle (3 günden eski)
     state = {k: v for k, v in state.items() if now - v < 3 * 86400}
     save_state(state)
