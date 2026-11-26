@@ -1462,6 +1462,73 @@ SNIPER_ALERTS = []
 SNIPER_SENT_HISTORY = {}
 SNIPER_MIN_SCORE = 90
 US500_CACHE = {"assets": None, "ts": 0}
+LIVE_MOVERS_CACHE = {"movers": [], "total_universe": 0, "ts": 0}
+SECTOR_MAP = {}
+LAST_DF_CACHE = {}
+REGIME_CACHE = {"data": None, "ts": 0}
+
+MIN_DAYTRADE_PRICE = float(os.getenv("MIN_STOCK_PRICE", "3.0"))
+MIN_DOLLAR_VOL = float(os.getenv("MIN_DOLLAR_VOL", "2000000"))
+MAX_CHASE_PCT = float(os.getenv("MAX_CHASE_PCT", "30.0"))
+
+
+def is_us_market_open():
+    """
+    ABD NASDAQ işlem saatlerini kontrol eder (New York saati, Pzt-Cum):
+    - Pre-Market:  04:00 - 09:30 ET (işlem açık)
+    - Ana Seans:   09:30 - 16:00 ET (işlem açık)
+    - After-Hours: 16:00 - 20:00 ET (işlem açık)
+    - Gece / Hafta sonu: kapalı
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        ny = datetime.now(ZoneInfo("America/New_York"))
+        if ny.weekday() >= 5:
+            return False, f"Hafta Sonu ({ny.strftime('%H:%M')} NY)"
+        mins = ny.hour * 60 + ny.minute
+        if 570 <= mins < 960:   # 09:30 - 16:00 ET
+            return True, f"ANA SEANS ({ny.strftime('%H:%M')} NY)"
+        if 240 <= mins < 570:   # 04:00 - 09:30 ET
+            return True, f"PRE-MARKET ({ny.strftime('%H:%M')} NY)"
+        if 960 <= mins < 1200:  # 16:00 - 20:00 ET
+            return True, f"AFTER-HOURS ({ny.strftime('%H:%M')} NY)"
+        return False, f"GECE KAPALI ({ny.strftime('%H:%M')} NY)"
+    except Exception:
+        return True, "Bilinmiyor"
+
+
+def get_market_regime():
+    """NASDAQ 100 (^NDX vs EMA50) ve VIX (^VIX) üzerinden piyasa rejimini belirler (15 dk önbellekli)."""
+    now = time.time()
+    if REGIME_CACHE["data"] and (now - REGIME_CACHE["ts"] < 900):
+        return REGIME_CACHE["data"]
+    default = {"label": "NÖTR 🟡", "scale": 1.0, "ndx_above_ema50": True, "vix": None, "ndx_chg": 0.0}
+    try:
+        import yfinance as yf
+        df = yf.download(["^NDX", "^VIX"], period="4mo", interval="1d", progress=False, auto_adjust=False, threads=False)
+        close = df["Close"] if "Close" in df else df
+        ndx = close["^NDX"].dropna() if "^NDX" in close else None
+        vix_s = close["^VIX"].dropna() if "^VIX" in close else None
+        if ndx is not None and len(ndx) >= 50:
+            last_ndx = float(ndx.iloc[-1])
+            prev_ndx = float(ndx.iloc[-2])
+            ndx_chg = round((last_ndx / prev_ndx - 1) * 100.0, 2) if prev_ndx else 0.0
+            ema50 = float(ndx.ewm(span=50, adjust=False).mean().iloc[-1])
+            above = last_ndx >= ema50
+            vix = round(float(vix_s.iloc[-1]), 1) if (vix_s is not None and len(vix_s) > 0) else 18.0
+            if above and vix < 20:
+                label, scale = "BOĞA (RISK-ON) 🟢", 1.0
+            elif (not above and vix >= 22) or vix >= 28:
+                label, scale = "AYI / YÜKSEK RİSK 🔴", 0.50
+            else:
+                label, scale = "SEÇİCİ / TEMKİNLİ 🟡", 0.75
+            res = {"label": label, "scale": scale, "ndx_above_ema50": above, "vix": vix, "ndx_chg": ndx_chg}
+            REGIME_CACHE["data"] = res
+            REGIME_CACHE["ts"] = now
+            return res
+    except Exception as e:
+        print(f"Market regime error: {e}")
+    return default
 
 NASDAQ100_TICKERS = [
     "AAPL","ABNB","ADBE","ADI","ADP","ADSK","AEP","AMAT","AMD","AMGN",
@@ -1477,36 +1544,148 @@ NASDAQ100_TICKERS = [
     "WDAY","XEL","ZS"
 ]
 
-def _get_us_500_assets():
-    """Sadece resmi NASDAQ borsasında işlem gören hisseler (NASDAQ 100 + NASDAQ Global Select Market, 24 saat önbellekli)."""
-    now = time.time()
-    if US500_CACHE["assets"] and (now - US500_CACHE["ts"] < 86400):
-        return US500_CACHE["assets"]
-    max_tickers = int(os.getenv("NASDAQ_MAX_TICKERS", "500"))
-    seen = set(NASDAQ100_TICKERS)
-    ordered = list(NASDAQ100_TICKERS)
+def _parse_num(val):
+    try:
+        s = str(val or "").replace("$", "").replace("%", "").replace(",", "").strip()
+        return float(s) if s and s not in ("N/A", "--", "-") else 0.0
+    except Exception:
+        return 0.0
+
+def _fetch_nasdaq_live_screener():
+    """Tüm NASDAQ borsasını (4.300+ hisse: Q/G/S) tek istekte çeker; anlık yükselenler ve hacim liderlerini ayırır."""
     try:
         import requests
-        r = requests.get("https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt", timeout=12)
-        if r.status_code == 200:
-            for line in r.text.splitlines()[1:-1]:
-                parts = line.split("|")
-                if len(parts) < 7:
-                    continue
-                sym, _name, mcat, test_issue, _status, _lot, etf = parts[:7]
-                sym = sym.strip().upper()
-                # Sadece gercek NASDAQ Global Select (Q) hisseleri, ETF ve test hisseleri haric
-                if mcat == "Q" and test_issue == "N" and etf == "N" and sym.isalpha() and 1 <= len(sym) <= 4:
-                    if sym not in seen:
-                        seen.add(sym)
-                        ordered.append(sym)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+        }
+        r = requests.get(
+            "https://api.nasdaq.com/api/screener/stocks?tableonly=true&exchange=nasdaq&download=true",
+            headers=headers, timeout=18,
+        )
+        if r.status_code != 200:
+            return []
+        rows = r.json().get("data", {}).get("rows", []) or []
+        parsed = []
+        for x in rows:
+            sym = str(x.get("symbol", "")).strip().upper()
+            if not sym or not sym.isalpha() or not (1 <= len(sym) <= 5):
+                continue
+            price = _parse_num(x.get("lastsale"))
+            pct = _parse_num(x.get("pctchange"))
+            vol = int(_parse_num(x.get("volume")))
+            mcap = _parse_num(x.get("marketCap"))
+            if price < 1.0:
+                continue
+            sector = str(x.get("sector", "") or "Diğer").strip() or "Diğer"
+            SECTOR_MAP[sym] = sector
+            parsed.append({
+                "symbol": sym,
+                "name": str(x.get("name", sym))[:45],
+                "sector": sector,
+                "price": price,
+                "pct": pct,
+                "volume": vol,
+                "dollar_vol": price * vol,
+                "mcap": mcap,
+            })
+        return parsed
+    except Exception as e:
+        print(f"NASDAQ live screener error: {e}")
+        return []
+
+def get_live_nasdaq_movers(limit=8):
+    """4.300+ NASDAQ hissesi arasından günün en sert hacimli yükselenlerini döndürür."""
+    return LIVE_MOVERS_CACHE["movers"][:limit]
+
+def get_premarket_gappers(limit=8):
+    """Pre-Market / Açılış için +4% üstü gap atan likit ($3+, hacimli) NASDAQ hisselerini döndürür."""
+    return [
+        x for x in LIVE_MOVERS_CACHE.get("gappers", [])
+        if x.get("price", 0) >= MIN_DAYTRADE_PRICE and x.get("pct", 0) >= 4.0
+    ][:limit]
+
+def _get_us_500_assets(extra_symbols=None):
+    """
+    Tüm NASDAQ borsasını (4.300+ hisse) tarayarak akıllı aday havuzu oluşturur (10 dk önbellekli):
+    1) NASDAQ 100 çekirdek hisseler
+    2) Günün en çok yükselen hacimli NASDAQ hisseleri (tüm Q/G/S pazarları — XLAB gibi hareketleri kaçırmaz)
+    3) Günün en yüksek hacimli NASDAQ hisseleri
+    4) En büyük piyasa değerli NASDAQ hisseleri (toplam NASDAQ_MAX_TICKERS, varsayılan 800)
+    """
+    now = time.time()
+    max_tickers = int(os.getenv("NASDAQ_MAX_TICKERS", "800"))
+    if US500_CACHE["assets"] and (now - US500_CACHE["ts"] < 600) and not extra_symbols:
+        return US500_CACHE["assets"]
+
+    seen = set()
+    ordered = []
+
+    def _add(sym):
+        s = str(sym or "").strip().upper()
+        if s and s.isalpha() and 1 <= len(s) <= 5 and s not in seen:
+            seen.add(s)
+            ordered.append(s)
+
+    # 0) Açık pozisyon / bekleyen plan hisseleri varsa kesinlikle dahil et
+    for s in (extra_symbols or []):
+        _add(s)
+
+    # 1) NASDAQ 100 çekirdek
+    for s in NASDAQ100_TICKERS:
+        _add(s)
+
+    # 2) Tüm 4.300+ NASDAQ canlı tarayıcısı
+    rows = _fetch_nasdaq_live_screener()
+    if rows:
+        LIVE_MOVERS_CACHE["total_universe"] = len(rows)
+        # Günün sert yükselenleri (hacim >= 150k, değişim >= +%3)
+        gainers = [x for x in rows if x["pct"] >= 3.0 and x["volume"] >= 150_000]
+        gainers.sort(key=lambda x: x["pct"], reverse=True)
+        LIVE_MOVERS_CACHE["movers"] = [
+            x for x in gainers if x["pct"] >= 6.0 and x["volume"] >= 250_000
+        ][:20]
+        LIVE_MOVERS_CACHE["gappers"] = [
+            x for x in gainers if x["pct"] >= 4.0 and x["price"] >= MIN_DAYTRADE_PRICE and x["volume"] >= 100_000
+        ][:20]
+        LIVE_MOVERS_CACHE["ts"] = now
+
+        for x in gainers[:180]:
+            _add(x["symbol"])
+
+        # En yüksek hacimli aktif hisseler
+        actives = sorted(rows, key=lambda x: x["volume"], reverse=True)
+        for x in actives[:150]:
+            _add(x["symbol"])
+
+        # Kalan kontenjanı piyasa değerine göre en büyük NASDAQ hisseleriyle doldur
+        by_mcap = sorted(rows, key=lambda x: x["mcap"], reverse=True)
+        for x in by_mcap:
+            if len(ordered) >= max_tickers:
+                break
+            _add(x["symbol"])
+    else:
+        # Yedek: resmi nasdaqlisted.txt (Q + G + S pazarları)
+        try:
+            import requests
+            r = requests.get("https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt", timeout=12)
+            if r.status_code == 200:
+                for line in r.text.splitlines()[1:-1]:
+                    parts = line.split("|")
+                    if len(parts) < 7:
+                        continue
+                    sym, _name, mcat, test_issue, _status, _lot, etf = parts[:7]
+                    sym = sym.strip().upper()
+                    if mcat in ("Q", "G", "S") and test_issue == "N" and etf == "N" and sym.isalpha() and 1 <= len(sym) <= 5:
+                        _add(sym)
                         if len(ordered) >= max_tickers:
                             break
-    except Exception as e:
-        print(f"NASDAQ official list fetch error: {e}")
+        except Exception as e:
+            print(f"NASDAQ official list fetch error: {e}")
+
     assets = [
         {"symbol": t, "label": f"{t} (NASDAQ)", "short": t, "category": "NASDAQ",
-         "source": "yfinance", "currency": "$", "tv_symbol": f"NASDAQ:{t}"}
+         "sector": SECTOR_MAP.get(t, "Diğer"), "source": "yfinance", "currency": "$", "tv_symbol": f"NASDAQ:{t}"}
         for t in ordered[:max_tickers]
     ]
     US500_CACHE["assets"] = assets
@@ -1598,74 +1777,93 @@ def _compute_setup_from_df(df, meta):
         atr = price * 0.02
 
     vol_ratio = 1.0
+    avg_dollar_vol = 0.0
     if vol is not None and len(vol) >= 20:
         avg_v = float(vol.tail(20).mean())
+        avg_dollar_vol = avg_v * price
         if avg_v > 0:
             vol_ratio = float(vol.iloc[-1]) / avg_v
+
+    atr_pct = (atr / price) * 100.0 if price > 0 else 2.0
 
     recent_high_20 = float(high.tail(20).max())
     recent_low_20 = float(low.tail(20).min())
     recent_low_10 = float(low.tail(10).min())
 
-    breakout = max(recent_high_20, price + 0.6 * atr)
-    support_1 = min(price - 0.5 * atr, max(ema20, recent_low_10))
+    breakout = max(recent_high_20, price + 0.5 * atr)
+    support_1 = min(price - 0.45 * atr, max(ema20, recent_low_10))
     if support_1 >= price:
-        support_1 = price - 0.8 * atr
-    support_2 = min(support_1 - 0.8 * atr, recent_low_20)
+        support_1 = price - 0.65 * atr
+    support_2 = min(support_1 - 0.65 * atr, recent_low_20)
     if support_2 <= 0:
-        support_2 = price * 0.92
+        support_2 = price * 0.94
 
     entry_1 = (price + support_1) / 2.0
     entry_2 = (support_1 + support_2) / 2.0
     entry_breakout = breakout * 1.003
 
-    stop_loss = max(support_2 - 0.5 * atr, price * 0.86)
+    # Günlük al-sat için daha sıkı ve kontrollü stop (en fazla ~%8.5 mesafe)
+    stop_loss = max(support_2 - 0.3 * atr, price * 0.915)
     if stop_loss >= entry_2:
-        stop_loss = entry_2 * 0.975
+        stop_loss = min(entry_2 * 0.98, price * 0.96)
 
-    risk = max(entry_1 - stop_loss, atr * 0.8)
-    risk_pct = ((entry_1 - stop_loss) / entry_1) * 100.0 if entry_1 > 0 else 3.0
+    risk = max(price - stop_loss, atr * 0.7)
+    risk_pct = ((price - stop_loss) / price) * 100.0 if price > 0 else 3.0
 
-    tp1 = max(breakout, entry_1 + 1.5 * risk)
-    tp2 = entry_1 + 2.5 * risk
-    tp3 = entry_1 + 4.0 * risk
-    rr_ratio = (tp2 - entry_1) / risk if risk > 0 else 2.0
+    tp1 = max(breakout, price + 1.4 * risk)
+    tp2 = price + 2.3 * risk
+    tp3 = price + 3.5 * risk
+    rr_ratio = (tp2 - price) / risk if risk > 0 else 2.0
 
     score = 0
     confirmations = 0
     reasons = []
     if price > ema20 and ema20 > ema50:
-        score += 22; confirmations += 1; reasons.append("Güçlü yükseliş trendi (EMA20>EMA50)")
+        score += 20; confirmations += 1; reasons.append("Güçlü yükseliş trendi (EMA20>EMA50)")
     elif price > ema20:
         score += 12; reasons.append("Fiyat EMA20 üstünde")
     else:
         reasons.append("Fiyat EMA20 altında")
     if price > ema100:
-        score += 8; confirmations += 1
+        score += 7; confirmations += 1
     if macd_bull:
-        score += 15; confirmations += 1; reasons.append("MACD pozitif")
-    if 44 <= rsi <= 66:
-        score += 15; confirmations += 1; reasons.append(f"RSI ideal ({rsi:.0f})")
+        score += 14; confirmations += 1; reasons.append("MACD pozitif")
+    if 44 <= rsi <= 68:
+        score += 14; confirmations += 1; reasons.append(f"RSI ideal ({rsi:.0f})")
     elif 35 <= rsi < 44:
         score += 10; reasons.append(f"RSI destek bölgesinde ({rsi:.0f})")
     elif rsi < 35:
         score += 8; reasons.append(f"RSI aşırı satım ({rsi:.0f})")
-    elif rsi > 74:
+    elif rsi > 82:
         score -= 10; reasons.append(f"RSI aşırı alım ({rsi:.0f})")
-    if vol_ratio >= 1.25:
-        score += 15; confirmations += 1; reasons.append(f"Hacim güçlü ({vol_ratio:.1f}x)")
+    if vol_ratio >= 3.0 and change_pct >= 3.0 and price > ema20:
+        score += 20; confirmations += 1; reasons.append(f"🔥 RVOL patlaması ({vol_ratio:.1f}x hacim, +%{change_pct:.1f})")
+    elif vol_ratio >= 1.8 and change_pct >= 4.0 and price > ema20:
+        score += 16; confirmations += 1; reasons.append(f"Sert momentum (+%{change_pct:.1f}, {vol_ratio:.1f}x hacim)")
+    elif vol_ratio >= 1.25:
+        score += 13; confirmations += 1; reasons.append(f"Hacim güçlü ({vol_ratio:.1f}x)")
     elif vol_ratio >= 0.95:
-        score += 8
+        score += 7
+    # Günlük al-sat için ideal hareketlilik (ATR %2.2 - %9.5)
+    if 2.2 <= atr_pct <= 9.5:
+        score += 7; confirmations += 1; reasons.append(f"Günlük al-sat oynaklığı ideal (%{atr_pct:.1f})")
     dist_to_breakout = ((breakout - price) / price) * 100.0
     dist_to_s1 = ((price - support_1) / price) * 100.0
     if 0 < dist_to_breakout <= 3.5:
-        score += 15; confirmations += 1; reasons.append(f"Kırılıma çok yakın (+%{dist_to_breakout:.1f})")
+        score += 14; confirmations += 1; reasons.append(f"Kırılıma çok yakın (+%{dist_to_breakout:.1f})")
     elif 0 < dist_to_s1 <= 3.0:
-        score += 12; confirmations += 1; reasons.append(f"S1 desteğine yakın (-%{dist_to_s1:.1f})")
+        score += 11; confirmations += 1; reasons.append(f"S1 desteğine yakın (-%{dist_to_s1:.1f})")
     elif 0 < dist_to_breakout <= 7.0:
-        score += 8
-    if rr_ratio >= 2.2:
-        score += 10; confirmations += 1
+        score += 7
+    if rr_ratio >= 2.0:
+        score += 8; confirmations += 1
+
+    # Ucuz hisse / likidite / FOMO koruma bayrağı (otomatik alım filtresi)
+    tradeable = (
+        price >= MIN_DAYTRADE_PRICE
+        and (avg_dollar_vol == 0 or avg_dollar_vol >= MIN_DOLLAR_VOL)
+        and change_pct <= MAX_CHASE_PCT
+    )
 
     score = max(5, min(98, int(score)))
     is_sniper = score >= SNIPER_MIN_SCORE
@@ -1682,18 +1880,21 @@ def _compute_setup_from_df(df, meta):
 
     return {
         "symbol": meta["symbol"], "short": meta["short"], "label": meta["label"],
-        "category": meta["category"], "currency": meta["currency"], "tv_symbol": meta["tv_symbol"],
+        "category": meta["category"], "sector": meta.get("sector") or SECTOR_MAP.get(meta["symbol"], "Diğer"),
+        "currency": meta["currency"], "tv_symbol": meta["tv_symbol"],
         "price": _fmt_price(price), "change": round(change_pct, 2), "rsi": round(rsi, 1),
-        "vol_ratio": round(vol_ratio, 2), "confirmations": confirmations, "score": score,
+        "vol_ratio": round(vol_ratio, 2), "atr_pct": round(atr_pct, 2),
+        "dollar_vol": round(avg_dollar_vol, 0), "tradeable": tradeable,
+        "confirmations": confirmations, "score": score,
         "is_sniper": is_sniper, "decision": decision, "decision_type": decision_type,
         "breakout": _fmt_price(breakout), "breakout_dist_pct": round(dist_to_breakout, 2),
         "support_1": _fmt_price(support_1), "support_2": _fmt_price(support_2),
         "entry_1": _fmt_price(entry_1), "entry_2": _fmt_price(entry_2), "entry_breakout": _fmt_price(entry_breakout),
         "stop_loss": _fmt_price(stop_loss), "risk_pct": round(risk_pct, 2),
         "tp1": _fmt_price(tp1), "tp2": _fmt_price(tp2), "tp3": _fmt_price(tp3),
-        "tp1_pct": round(((tp1 - entry_1) / entry_1) * 100.0, 2),
-        "tp2_pct": round(((tp2 - entry_1) / entry_1) * 100.0, 2),
-        "tp3_pct": round(((tp3 - entry_1) / entry_1) * 100.0, 2),
+        "tp1_pct": round(((tp1 - price) / price) * 100.0, 2),
+        "tp2_pct": round(((tp2 - price) / price) * 100.0, 2),
+        "tp3_pct": round(((tp3 - price) / price) * 100.0, 2),
         "summary": " • ".join(reasons[:3]), "scanned_at": datetime.now().strftime("%H:%M")
     }
 
@@ -1801,14 +2002,24 @@ def fetch_nasdaq_news_headlines(limit=10):
     return items[:limit]
 
 def _analyze_options_flow(symbol):
-    """En yakın vadeli opsiyon zincirinden Call/Put hacmi, Open Interest ve IV verisini analiz eder."""
+    """7-45 gün vadeli opsiyon zincirinden (haftalık 0-2 DTE gürültüsünü eleyerek) Call/Put akışını analiz eder."""
     try:
         import yfinance as yf
         tk = yf.Ticker(symbol)
         exps = getattr(tk, "options", None)
         if not exps:
             return None
-        exp = exps[0]
+        today = datetime.now().date()
+        chosen_exp = None
+        for e in exps:
+            try:
+                dte = (datetime.strptime(e, "%Y-%m-%d").date() - today).days
+                if 7 <= dte <= 45:
+                    chosen_exp = e
+                    break
+            except Exception:
+                continue
+        exp = chosen_exp or exps[0]
         chain = tk.option_chain(exp)
         calls, puts = chain.calls, chain.puts
         if calls is None or puts is None or (calls.empty and puts.empty):
@@ -1820,22 +2031,31 @@ def _analyze_options_flow(symbol):
         iv_vals = calls["impliedVolatility"].dropna() if "impliedVolatility" in calls else []
         avg_iv = round(float(iv_vals.median()) * 100.0, 1) if len(iv_vals) > 0 else 0.0
 
-        # Hacim yoksa Open Interest kullan
-        num = put_vol if (call_vol + put_vol) >= 100 else put_oi
-        den = call_vol if (call_vol + put_vol) >= 100 else call_oi
+        # Gerçekçi likidite eşiği: çok düşük hacimli opsiyon zincirinde sinyal üretme
+        if (call_vol + put_vol) >= 200:
+            num, den = put_vol, call_vol
+        elif (call_oi + put_oi) >= 500:
+            num, den = put_oi, call_oi
+        else:
+            return None
         if den <= 0:
             return None
         pc_ratio = round(num / den, 2)
 
         delta = 0
-        if pc_ratio < 0.65 and den >= 300:
-            delta = 8
+        unusual = False
+        if call_vol >= 500 and call_oi > 0 and call_vol >= 2.0 * call_oi and pc_ratio < 0.85:
+            unusual = True
+            delta = 9
+            bias = f"⚡ OLAĞANDIŞI CALL (Vol {call_vol:,} > 2x OI, P/C {pc_ratio})"
+        elif pc_ratio < 0.60 and den >= 500:
+            delta = 6
             bias = f"Güçlü CALL akışı (P/C {pc_ratio})"
-        elif pc_ratio < 0.90 and den >= 150:
-            delta = 4
+        elif pc_ratio < 0.85 and den >= 250:
+            delta = 3
             bias = f"CALL ağırlıklı (P/C {pc_ratio})"
-        elif pc_ratio > 1.35 and num >= 300:
-            delta = -10
+        elif pc_ratio > 1.35 and num >= 400:
+            delta = -8
             bias = f"Yüksek PUT koruması (P/C {pc_ratio})"
         else:
             bias = f"Dengeli opsiyon (P/C {pc_ratio})"
@@ -1848,51 +2068,148 @@ def _analyze_options_flow(symbol):
             "put_oi": put_oi,
             "pc_ratio": pc_ratio,
             "avg_iv": avg_iv,
+            "unusual": unusual,
             "score_delta": delta,
             "summary": f"Opsiyon ({exp}): {bias} | IV %{avg_iv}"
         }
     except Exception:
         return None
 
+
+def _compute_intraday_vwap(symbol):
+    """Son 15 dakikalık gün içi (+ pre/after-hours) mumlardan güncel günün VWAP seviyesini hesaplar."""
+    try:
+        import yfinance as yf
+        df = yf.download(symbol, period="5d", interval="15m", prepost=True, progress=False, auto_adjust=False, threads=False)
+        if df is None or df.empty:
+            return None
+        if hasattr(df.columns, "levels"):
+            df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+        last_day = df.index[-1].date()
+        day_df = df[df.index.date == last_day]
+        if day_df.empty:
+            day_df = df.tail(26)
+        vol = day_df["Volume"].astype(float)
+        if float(vol.sum()) <= 0:
+            return None
+        tp = (day_df["High"].astype(float) + day_df["Low"].astype(float) + day_df["Close"].astype(float)) / 3.0
+        vwap = float((tp * vol).sum() / vol.sum())
+        return _fmt_price(vwap) if vwap > 0 else None
+    except Exception:
+        return None
+
+
+def _has_upcoming_earnings(symbol, days_ahead=2):
+    """Hissenin önümüzdeki 2 gün içinde bilanço (earnings) açıklaması varsa True döndürür."""
+    try:
+        import yfinance as yf
+        cal = yf.Ticker(symbol).calendar
+        if not cal:
+            return False
+        dates = []
+        if isinstance(cal, dict):
+            ev = cal.get("Earnings Date") or cal.get("Earnings High")
+            if isinstance(ev, (list, tuple)):
+                dates.extend(ev)
+            elif ev is not None:
+                dates.append(ev)
+        today = datetime.now().date()
+        for d in dates:
+            try:
+                dt = d.date() if hasattr(d, "date") else datetime.strptime(str(d)[:10], "%Y-%m-%d").date()
+                diff = (dt - today).days
+                if 0 <= diff <= days_ahead:
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
+
+
 def _enrich_with_options_and_news(setups, top_n=15):
-    """En yüksek puanlı adaylara opsiyon zinciri (Call/Put) ve hisse haber duyarlılığı puanı ekler."""
+    """En yüksek puanlı adaylara 7-45 DTE opsiyon, gün içi VWAP, bilanço uyarısı ve AI/haber duyarlılığı ekler."""
     import yfinance as yf
+    try:
+        import chart_ai
+    except ImportError:
+        try:
+            from src import chart_ai
+        except ImportError:
+            chart_ai = None
+
     for s in setups[:top_n]:
         sym = s["symbol"]
         extra_notes = []
+
+        # 1) 7-45 DTE Opsiyon Akışı
         opt = _analyze_options_flow(sym)
         if opt:
             s["options"] = opt
             s["score"] = max(5, min(98, s["score"] + opt["score_delta"]))
             extra_notes.append(opt["summary"])
 
-        # Hisseye özel son haberler (yfinance)
+        # 2) Gün içi 15m VWAP teyidi (günlük al-sat için)
+        vwap = _compute_intraday_vwap(sym)
+        if vwap:
+            s["vwap"] = vwap
+            if s["price"] >= vwap:
+                s["score"] = min(98, s["score"] + 5)
+                extra_notes.append(f"VWAP üstünde (${vwap})")
+            else:
+                s["score"] = max(5, s["score"] - 4)
+                extra_notes.append(f"VWAP altında (${vwap})")
+
+        # 3) Yakın bilanço (earnings) gap koruması
+        if _has_upcoming_earnings(sym, days_ahead=2):
+            s["earnings_warning"] = True
+            s["score"] = max(5, s["score"] - 10)
+            extra_notes.append("⚠️ Yakın bilanço riski")
+
+        # 3b) Short Squeeze radarı (Short Float >= %15 + yüksek hacim + pozitif hareket)
+        try:
+            if s.get("vol_ratio", 1.0) >= 1.5 and s.get("change", 0) > 0:
+                info = yf.Ticker(sym).fast_info if False else (yf.Ticker(sym).info or {})
+                sf = info.get("shortPercentOfFloat")
+                if sf and isinstance(sf, (int, float)):
+                    sf_pct = round(sf * 100.0 if sf <= 1.0 else sf, 1)
+                    s["short_float_pct"] = sf_pct
+                    if sf_pct >= 15.0:
+                        s["squeeze_candidate"] = True
+                        s["score"] = min(98, s["score"] + 6)
+                        extra_notes.append(f"🔥 Short Squeeze adayı (%{sf_pct} Short)")
+        except Exception:
+            pass
+
+        # 4) Hisseye özel son haberler (Groq AI varsa AI sınıflandırması, yoksa düşük ağırlıklı yedek)
         try:
             tk_news = yf.Ticker(sym).news or []
-            pos_c, neg_c = 0, 0
-            top_headline = ""
+            headlines = []
             for n in tk_news[:5]:
                 content = n.get("content", {}) if isinstance(n, dict) else {}
                 title = n.get("title") or content.get("title") or ""
-                if not title:
-                    continue
-                if not top_headline:
-                    top_headline = title
-                sv, _ = _score_headline_sentiment(title)
-                if sv > 0:
-                    pos_c += 1
-                elif sv < 0:
-                    neg_c += 1
-            if pos_c > neg_c:
-                s["score"] = min(98, s["score"] + 6)
-                s["news_bias"] = "POZİTİF"
-                extra_notes.append(f"Haber pozitif ({top_headline[:55]})")
-            elif neg_c > pos_c:
-                s["score"] = max(5, s["score"] - 8)
-                s["news_bias"] = "NEGATİF"
-                extra_notes.append(f"Haber negatif ({top_headline[:55]})")
-            if top_headline:
-                s["latest_news"] = top_headline
+                if title:
+                    headlines.append(title)
+            if headlines:
+                s["latest_news"] = headlines[0]
+                ai_sent = chart_ai.classify_news_with_ai(sym, headlines) if chart_ai else None
+                if ai_sent is not None:
+                    sv, lbl = ai_sent
+                    s["news_bias"] = f"{lbl} (AI)"
+                    if sv > 0:
+                        s["score"] = min(98, s["score"] + 5)
+                    elif sv < 0:
+                        s["score"] = max(5, s["score"] - 6)
+                else:
+                    # Yedek kelime skoru düşük ağırlıkta tutulur
+                    pos_c = sum(1 for h in headlines if _score_headline_sentiment(h)[0] > 0)
+                    neg_c = sum(1 for h in headlines if _score_headline_sentiment(h)[0] < 0)
+                    if pos_c > neg_c:
+                        s["score"] = min(98, s["score"] + 3)
+                        s["news_bias"] = "POZİTİF"
+                    elif neg_c > pos_c:
+                        s["score"] = max(5, s["score"] - 3)
+                        s["news_bias"] = "NEGATİF"
         except Exception:
             pass
 
@@ -1913,14 +2230,50 @@ def _enrich_with_options_and_news(setups, top_n=15):
     setups.sort(key=lambda x: x["score"], reverse=True)
     return setups
 
-def _run_full_market_scan():
-    """Sadece resmi NASDAQ hisselerini (~500 hisse) tarar; en iyi 15 adaya opsiyon (Call/Put) + haber teyidi ekler."""
+
+def analyze_single_symbol(query, enrich=True):
+    """Herhangi bir NASDAQ/ABD hissesini (ör. XLAB, NVDA) anlık teknik + VWAP + opsiyon + haber ile analiz eder."""
+    q = str(query or "").strip().upper().replace("$", "").replace(" ", "")
+    if not q:
+        return None
+    aliases = {"NASDAQ": "^NDX", "NDX": "^NDX", "SP500": "^GSPC", "SPX": "^GSPC"}
+    sym = aliases.get(q, q)
+    df = _fetch_yfinance_ohlcv(sym)
+    if df is None or len(df) < 25:
+        return None
+    LAST_DF_CACHE[sym] = df
+    meta = {
+        "symbol": sym, "label": f"{q} (NASDAQ)", "short": q, "category": "NASDAQ",
+        "sector": SECTOR_MAP.get(sym, "Diğer"), "source": "yfinance", "currency": "$",
+        "tv_symbol": f"NASDAQ:{q}" if not sym.startswith("^") else "NASDAQ:NDX",
+    }
+    res = _compute_setup_from_df(df, meta)
+    if res and enrich and not sym.startswith("^"):
+        _enrich_with_options_and_news([res], top_n=1)
+    return res
+
+
+def _run_full_market_scan(extra_symbols=None):
+    """Tüm NASDAQ borsasını (4.300+ hisse canlı ön eleme + 800 hisse derin teknik analiz) tarar; en iyi 15 adaya opsiyon + VWAP + bilanço + AI haber teyidi ekler."""
     global SNIPER_ALERTS
     setups = []
-    yf_assets = _get_us_500_assets()
+    extra_syms = list(extra_symbols or [])
+    try:
+        try:
+            import paper_trader
+        except ImportError:
+            from src import paper_trader
+        st = paper_trader.load_state()
+        for p in st.get("positions", []) + st.get("plans", []):
+            if p.get("symbol"):
+                extra_syms.append(p["symbol"])
+    except Exception:
+        pass
+
+    yf_assets = _get_us_500_assets(extra_symbols=extra_syms)
     try:
         import yfinance as yf
-        chunk_size = 80
+        chunk_size = 100
         for i in range(0, len(yf_assets), chunk_size):
             chunk = yf_assets[i:i + chunk_size]
             tickers = [m["symbol"] for m in chunk]
@@ -1934,6 +2287,7 @@ def _run_full_market_scan():
                         sub = sub[cols].dropna()
                         res = _compute_setup_from_df(sub, meta)
                         if res:
+                            LAST_DF_CACHE[sym] = sub
                             setups.append(res)
             except Exception as ce:
                 print(f"NASDAQ chunk error ({i}): {ce}")
