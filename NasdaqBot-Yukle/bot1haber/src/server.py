@@ -1463,6 +1463,7 @@ SNIPER_SENT_HISTORY = {}
 SNIPER_MIN_SCORE = 90
 US500_CACHE = {"assets": None, "ts": 0}
 LIVE_MOVERS_CACHE = {"movers": [], "total_universe": 0, "ts": 0}
+MARKET_RADAR_CACHE = {"advancing": 0, "declining": 0, "unchanged": 0, "top_sectors": [], "ts": 0}
 SECTOR_MAP = {}
 LAST_DF_CACHE = {}
 REGIME_CACHE = {"data": None, "ts": 0}
@@ -1605,6 +1606,10 @@ def get_premarket_gappers(limit=8):
         if x.get("price", 0) >= MIN_DAYTRADE_PRICE and x.get("pct", 0) >= 4.0
     ][:limit]
 
+def get_market_radar():
+    """4.300+ NASDAQ hissesinden yükselen/düşen dengesi ve lider sektörleri döndürür."""
+    return dict(MARKET_RADAR_CACHE)
+
 def _get_us_500_assets(extra_symbols=None):
     """
     Tüm NASDAQ borsasını (4.300+ hisse) tarayarak akıllı aday havuzu oluşturur (10 dk önbellekli):
@@ -1639,6 +1644,26 @@ def _get_us_500_assets(extra_symbols=None):
     rows = _fetch_nasdaq_live_screener()
     if rows:
         LIVE_MOVERS_CACHE["total_universe"] = len(rows)
+        # Piyasa Genişliği (Yükselen / Düşen) ve Lider Sektörler (OPT Radar tarzı)
+        adv = sum(1 for x in rows if x["pct"] > 0.05)
+        dec = sum(1 for x in rows if x["pct"] < -0.05)
+        unc = len(rows) - adv - dec
+        sec_stats = {}
+        for x in rows:
+            sc = x.get("sector", "Diğer")
+            if sc and sc != "Diğer" and -40 <= x["pct"] <= 40:
+                d = sec_stats.setdefault(sc, [0.0, 0])
+                d[0] += x["pct"]
+                d[1] += 1
+        top_secs = [
+            (sc, round(tot / cnt, 2))
+            for sc, (tot, cnt) in sec_stats.items() if cnt >= 15
+        ]
+        top_secs.sort(key=lambda t: t[1], reverse=True)
+        MARKET_RADAR_CACHE.update({
+            "advancing": adv, "declining": dec, "unchanged": unc,
+            "top_sectors": top_secs[:3], "ts": now
+        })
         # Günün sert yükselenleri (hacim >= 150k, değişim >= +%3)
         gainers = [x for x in rows if x["pct"] >= 3.0 and x["volume"] >= 150_000]
         gainers.sort(key=lambda x: x["pct"], reverse=True)
@@ -1811,8 +1836,8 @@ def _compute_setup_from_df(df, meta):
     risk_pct = ((price - stop_loss) / price) * 100.0 if price > 0 else 3.0
 
     tp1 = max(breakout, price + 1.4 * risk)
-    tp2 = price + 2.3 * risk
-    tp3 = price + 3.5 * risk
+    tp2 = max(tp1 + 0.9 * risk, price + 2.3 * risk)
+    tp3 = max(tp2 + 1.2 * risk, price + 3.5 * risk)
     rr_ratio = (tp2 - price) / risk if risk > 0 else 2.0
 
     score = 0
@@ -1863,6 +1888,31 @@ def _compute_setup_from_df(df, meta):
     if rr_ratio >= 2.0:
         score += 8; confirmations += 1
 
+    # Endekse Göre Göreceli Güç (Relative Strength vs NASDAQ 100)
+    ndx_chg = float((REGIME_CACHE.get("data") or {}).get("ndx_chg", 0.0) or 0.0)
+    rs_vs_ndx = round(change_pct - ndx_chg, 2)
+    rs_leader = (rs_vs_ndx >= 2.0 and price > ema20)
+    if rs_leader:
+        score += 7; confirmations += 1; reasons.append(f"💪 Endeksten güçlü (+%{rs_vs_ndx:.1f} RS)")
+
+    # Ayrı Risk Puanı (OPT tarzı: Düşük / Orta / Yüksek Risk)
+    risk_pts = 0
+    risk_pts += min(45, int(atr_pct * 5.0))
+    risk_pts += min(35, int(risk_pct * 3.0))
+    if avg_dollar_vol > 0 and avg_dollar_vol < 5_000_000:
+        risk_pts += 20
+    elif avg_dollar_vol > 0 and avg_dollar_vol < 20_000_000:
+        risk_pts += 10
+    if abs(change_pct) >= 12.0:
+        risk_pts += 12
+    risk_score = max(10, min(95, risk_pts))
+    if risk_score <= 38:
+        risk_label, risk_level = "🟢 Düşük Risk", "low"
+    elif risk_score <= 65:
+        risk_label, risk_level = "🟡 Orta Risk", "medium"
+    else:
+        risk_label, risk_level = "🔴 Yüksek Risk", "high"
+
     # Ucuz hisse / likidite / FOMO koruma bayrağı (otomatik alım filtresi)
     tradeable = (
         price >= MIN_DAYTRADE_PRICE
@@ -1871,6 +1921,34 @@ def _compute_setup_from_df(df, meta):
     )
 
     score = max(5, min(98, int(score)))
+
+    # OPT Tarzı 3 Vadeli Roket Puanları (Günlük / 2-3 Gün / Haftalık)
+    def _v_lbl(sc):
+        return "AL" if sc >= 70 else ("BEKLE" if sc >= 48 else "SAT")
+
+    g_score = max(10, min(98, int(
+        40
+        + (18 if vol_ratio >= 1.8 else (10 if vol_ratio >= 1.2 else 0))
+        + (15 if change_pct >= 2.0 else (8 if change_pct > 0 else -10))
+        + (12 if price > ema20 else -10)
+        + (10 if rs_leader else 0)
+        + (8 if 2.2 <= atr_pct <= 9.5 else 0)
+    )))
+    s_score = score
+    w_score = max(10, min(98, int(
+        30
+        + (25 if (price > ema20 and ema20 > ema50) else (10 if price > ema20 else -12))
+        + (15 if price > ema100 else -8)
+        + (15 if macd_bull else -8)
+        + (12 if 42 <= rsi <= 68 else (6 if oversold_bounce else 0))
+        + (8 if rs_leader else 0)
+    )))
+    horizons = {
+        "gunluk": {"score": g_score, "decision": _v_lbl(g_score), "target": _fmt_price(max(breakout, price + 1.1 * atr))},
+        "swing_2_3": {"score": s_score, "decision": _v_lbl(s_score), "target": _fmt_price(tp1)},
+        "haftalik": {"score": w_score, "decision": _v_lbl(w_score), "target": _fmt_price(tp2)},
+    }
+
     is_sniper = score >= SNIPER_MIN_SCORE
     if is_sniper:
         decision, decision_type = "🎯 SNIPER AL", "sniper"
@@ -1891,6 +1969,9 @@ def _compute_setup_from_df(df, meta):
         "vol_ratio": round(vol_ratio, 2), "atr_pct": round(atr_pct, 2),
         "dollar_vol": round(avg_dollar_vol, 0), "tradeable": tradeable,
         "oversold_bounce": oversold_bounce,
+        "rs_vs_ndx": rs_vs_ndx, "rs_leader": rs_leader,
+        "risk_score": risk_score, "risk_label": risk_label, "risk_level": risk_level,
+        "horizons": horizons,
         "confirmations": confirmations, "score": score,
         "is_sniper": is_sniper, "decision": decision, "decision_type": decision_type,
         "breakout": _fmt_price(breakout), "breakout_dist_pct": round(dist_to_breakout, 2),
@@ -2185,6 +2266,10 @@ def _enrich_with_options_and_news(setups, top_n=15):
                 s["orb_breakout"] = True
                 s["orb_high"] = intra.get("orb_high")
                 s["score"] = min(98, s["score"] + 8)
+                if s.get("horizons") and "gunluk" in s["horizons"]:
+                    gs = min(98, s["horizons"]["gunluk"]["score"] + 12)
+                    s["horizons"]["gunluk"]["score"] = gs
+                    s["horizons"]["gunluk"]["decision"] = "AL" if gs >= 70 else ("BEKLE" if gs >= 48 else "SAT")
                 extra_notes.append(f"🚀 ORB kırılımı (>${intra.get('orb_high')})")
 
         # 3) Yakın bilanço (earnings) gap koruması

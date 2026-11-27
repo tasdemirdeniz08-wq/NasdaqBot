@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>NasdaqBot Pro — Canlı Radar & Roketler</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --bg: #070b12;
+    --card: #0f1624;
+    --card2: #151f32;
+    --border: #1e293b;
+    --text: #f1f5f9;
+    --muted: #94a3b8;
+    --green: #10b981;
+    --red: #f43f5e;
+    --blue: #38bdf8;
+    --gold: #fbbf24;
+    --purple: #a855f7;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+    background: radial-gradient(circle at top right, #0f1d36 0%, var(--bg) 52%);
+    color: var(--text);
+    min-height: 100vh;
+    padding-bottom: 84px;
+  }
+  .container { max-width: 540px; margin: 0 auto; padding: 14px 14px 24px; }
+  .topbar {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 14px;
+  }
+  .brand { display: flex; align-items: center; gap: 8px; }
+  .logo {
+    width: 34px; height: 34px; border-radius: 10px;
+    background: linear-gradient(135deg, #0ea5e9, #10b981);
+    display: grid; place-items: center; font-weight: 800; font-size: 16px; color: #04131c;
+    box-shadow: 0 0 16px rgba(16,185,129,0.35);
+  }
+  .brand h1 { font-size: 16px; font-weight: 800; letter-spacing: 0.2px; }
+  .brand small { display: block; font-size: 11px; color: var(--muted); }
+  .pill {
+    font-size: 11px; font-weight: 700; padding: 5px 10px; border-radius: 999px;
+    background: var(--card2); border: 1px solid var(--border); color: var(--blue);
+  }
+  .pill.live { color: var(--green); border-color: rgba(16,185,129,0.35); }
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 16px; padding: 14px; margin-bottom: 12px;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.3);
+  }
+  .card-title {
+    font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.7px;
+    color: var(--muted); margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center;
+  }
+  .kpi-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .kpi { background: var(--card2); border-radius: 12px; padding: 11px; border: 1px solid rgba(255,255,255,0.04); }
+  .kpi .lbl { font-size: 11px; color: var(--muted); }
+  .kpi .val { font-size: 18px; font-weight: 800; margin-top: 3px; }
+  .kpi .sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .green { color: var(--green); }
+  .red { color: var(--red); }
+  .gold { color: var(--gold); }
+  .blue { color: var(--blue); }
+
+  /* Breadth Bar */
+  .breadth-bar {
+    height: 10px; border-radius: 999px; overflow: hidden; display: flex;
+    background: var(--card2); margin: 8px 0 6px;
+  }
+  .breadth-up { background: linear-gradient(90deg, #059669, #10b981); }
+  .breadth-dn { background: linear-gradient(90deg, #e11d48, #f43f5e); }
+  .breadth-labels { display: flex; justify-content: space-between; font-size: 12px; font-weight: 700; }
+
+  .sector-row { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+  .sector-chip {
+    background: var(--card2); border: 1px solid var(--border);
+    border-radius: 10px; padding: 6px 9px; font-size: 11.5px; font-weight: 600;
+  }
+
+  /* Filter & Search */
+  .controls { display: flex; gap: 6px; margin-bottom: 10px; flex-wrap: wrap; }
+  .search-input {
+    width: 100%; background: var(--card); border: 1px solid var(--border);
+    color: var(--text); border-radius: 12px; padding: 10px 12px; font-size: 13px;
+    margin-bottom: 10px; outline: none;
+  }
+  .search-input:focus { border-color: var(--blue); }
+  .chip-btn {
+    background: var(--card); border: 1px solid var(--border); color: var(--muted);
+    padding: 7px 11px; border-radius: 10px; font-size: 12px; font-weight: 700; cursor: pointer;
+  }
+  .chip-btn.active { background: rgba(56,189,248,0.16); border-color: var(--blue); color: var(--blue); }
+
+  /* Rocket Item */
+  .rocket {
+    background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+    padding: 12px; margin-bottom: 10px; cursor: pointer; transition: transform .12s, border-color .15s;
+  }
+  .rocket:active { transform: scale(0.985); }
+  .rocket:hover { border-color: rgba(56,189,248,0.45); }
+  .r-top { display: flex; justify-content: space-between; align-items: center; }
+  .r-sym { font-size: 16px; font-weight: 800; display: flex; align-items: center; gap: 6px; }
+  .r-sec { font-size: 11px; color: var(--muted); font-weight: 500; }
+  .score-badge {
+    font-size: 12px; font-weight: 800; padding: 4px 9px; border-radius: 9px;
+    background: rgba(16,185,129,0.16); color: var(--green); border: 1px solid rgba(16,185,129,0.35);
+  }
+  .score-badge.mid { background: rgba(251,191,36,0.15); color: var(--gold); border-color: rgba(251,191,36,0.35); }
+  .r-mid { display: flex; justify-content: space-between; align-items: baseline; margin: 7px 0; }
+  .r-price { font-size: 15px; font-weight: 800; }
+  .r-risk { font-size: 11.5px; font-weight: 700; }
+  .badges { display: flex; gap: 5px; flex-wrap: wrap; margin: 6px 0; }
+  .b-tag {
+    font-size: 10.5px; font-weight: 700; padding: 3px 7px; border-radius: 7px;
+    background: var(--card2); color: var(--text); border: 1px solid var(--border);
+  }
+  .hz-row {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-top: 8px;
+  }
+  .hz-box {
+    background: var(--card2); border-radius: 9px; padding: 6px 7px; text-align: center;
+    font-size: 11px;
+  }
+  .hz-box b { display: block; font-size: 12px; margin-top: 2px; }
+  .levels {
+    display: flex; justify-content: space-between; font-size: 11.5px; color: var(--muted);
+    margin-top: 8px; padding-top: 7px; border-top: 1px dashed var(--border);
+  }
+
+  /* Bottom Nav */
+  .nav {
+    position: fixed; bottom: 0; left: 0; right: 0; height: 68px;
+    background: rgba(10, 15, 25, 0.94); backdrop-filter: blur(14px);
+    border-top: 1px solid var(--border);
+    display: flex; justify-content: space-around; align-items: center; z-index: 40;
+  }
+  .nav button {
+    background: none; border: none; color: var(--muted); cursor: pointer;
+    display: flex; flex-direction: column; align-items: center; gap: 3px;
+    font-size: 11px; font-weight: 700; padding: 6px 14px; border-radius: 12px;
+  }
+  .nav button span.ic { font-size: 19px; }
+  .nav button.active { color: var(--blue); background: rgba(56,189,248,0.1); }
+
+  /* Modal */
+  .modal-bg {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.78); backdrop-filter: blur(6px);
+    display: none; align-items: flex-end; justify-content: center; z-index: 90;
+  }
+  .modal-bg.open { display: flex; }
+  .modal {
+    width: 100%; max-width: 540px; max-height: 92vh; overflow-y: auto;
+    background: var(--card); border-top-left-radius: 22px; border-top-right-radius: 22px;
+    border: 1px solid var(--border); padding: 16px 16px 26px;
+  }
+  .modal-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+  .close-btn {
+    background: var(--card2); border: 1px solid var(--border); color: var(--text);
+    width: 32px; height: 32px; border-radius: 10px; font-size: 16px; cursor: pointer;
+  }
+  .tv-wrap { height: 290px; border-radius: 12px; overflow: hidden; border: 1px solid var(--border); margin-bottom: 12px; }
+  .slider-box { background: var(--card2); border-radius: 12px; padding: 12px; margin-top: 10px; }
+  .slider-box input[type=range] { width: 100%; accent-color: var(--blue); margin: 8px 0; }
+  .sim-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-top: 8px; }
+  .sim-cell { background: var(--card); border-radius: 9px; padding: 8px; text-align: center; font-size: 11px; }
+  .sim-cell b { display: block; font-size: 13px; margin-top: 2px; }
+
+  .tab { display: none; }
+  .tab.active { display: block; }
+  .empty { text-align: center; color: var(--muted); padding: 28px 12px; font-size: 13px; }
+  .row-item {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 9px 0; border-bottom: 1px solid rgba(30,41,59,0.7); font-size: 13px;
+  }
+  .row-item:last-child { border-bottom: none; }
+  .disc { text-align: center; font-size: 11px; color: #64748b; margin-top: 14px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="topbar">
+    <div class="brand">
+      <div class="logo">N</div>
+      <div>
+        <h1>NasdaqBot Pro</h1>
+        <small id="updatedTxt">Canlı veri yükleniyor...</small>
+      </div>
+    </div>
+    <div class="pill live" id="marketPill">Yükleniyor</div>
+  </div>
+
+  <!-- TAB 1: RADAR -->
+  <div id="tab-radar" class="tab active">
+    <div class="card">
+      <div class="card-title">
+        <span>📡 Piyasa Radarı (4.300+ NASDAQ)</span>
+        <span id="regimePill" class="gold">-</span>
+      </div>
+      <div class="breadth-bar">
+        <div id="bUp" class="breadth-up" style="width:50%"></div>
+        <div id="bDn" class="breadth-dn" style="width:50%"></div>
+      </div>
+      <div class="breadth-labels">
+        <span class="green" id="advTxt">🟢 - Yükselen</span>
+        <span class="red" id="decTxt">🔴 - Düşen</span>
+      </div>
+      <div class="sector-row" id="sectorRow"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-title"><span>🚀 Günün En Güçlü 3 Roketi</span><span class="blue" style="cursor:pointer" onclick="switchTab('rockets')">Tümü →</span></div>
+      <div id="radarTop3"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-title"><span>🔥 Günün En Sert Yükselenleri (Hacimli)</span></div>
+      <div id="radarMovers"></div>
+    </div>
+  </div>
+
+  <!-- TAB 2: ROKETLER -->
+  <div id="tab-rockets" class="tab">
+    <input class="search-input" id="searchBox" placeholder="🔎 Hisse veya sektör ara (ör. NVDA, XLAB, Tech)..." oninput="renderRockets()" />
+    <div class="controls">
+      <button class="chip-btn active" id="fAll" onclick="setRiskFilter('all')">Tümü</button>
+      <button class="chip-btn" id="fLow" onclick="setRiskFilter('low')">🟢 Düşük Risk</button>
+      <button class="chip-btn" id="fOrb" onclick="setRiskFilter('orb')">🚀 ORB / Dönüş</button>
+      <button class="chip-btn" id="hSwing" onclick="setHorizon('swing_2_3')">2–3 Gün</button>
+      <button class="chip-btn" id="hDay" onclick="setHorizon('gunluk')">Günlük</button>
+      <button class="chip-btn" id="hWeek" onclick="setHorizon('haftalik')">Haftalık</button>
+    </div>
+    <div id="rocketsList"></div>
+  </div>
+
+  <!-- TAB 3: KARNE -->
+  <div id="tab-karne" class="tab">
+    <div class="card">
+      <div class="card-title"><span>🏆 Şeffaf Sinyal Karnesi</span><span class="muted">Gerçek $1.50 Komisyonlu</span></div>
+      <div class="kpi-grid" id="karneKpis"></div>
+    </div>
+    <div class="card">
+      <div class="card-title"><span>🚀 Rekor Kıran & Kapanan İşlemler</span></div>
+      <div id="karneClosed"></div>
+    </div>
+    <div class="card">
+      <div class="card-title"><span>🧠 Rozet Bazlı Performans</span></div>
+      <div id="karneBadges"></div>
+    </div>
+  </div>
+
+  <!-- TAB 4: PORTFÖY -->
+  <div id="tab-portfolio" class="tab">
+    <div class="card">
+      <div class="card-title"><span>💼 1500$ Sanal Portföy (Net)</span></div>
+      <div class="kpi-grid" id="portKpis"></div>
+    </div>
+    <div class="card">
+      <div class="card-title"><span>🟢 Açık Pozisyonlar</span></div>
+      <div id="portOpen"></div>
+    </div>
+  </div>
+
+  <div class="disc">Yatırım tavsiyesi değildir. Eğitim ve teknik analiz amaçlıdır.</div>
+</div>
+
+<!-- BOTTOM NAV -->
+<div class="nav">
+  <button class="active" id="nav-radar" onclick="switchTab('radar')"><span class="ic">📡</span>Radar</button>
+  <button id="nav-rockets" onclick="switchTab('rockets')"><span class="ic">🚀</span>Roketler</button>
+  <button id="nav-karne" onclick="switchTab('karne')"><span class="ic">🏆</span>Karne</button>
+  <button id="nav-portfolio" onclick="switchTab('portfolio')"><span class="ic">💼</span>Portföy</button>
+</div>
+
+<!-- DETAIL MODAL (LIVE TRADINGVIEW CHART + NE KAZANDIRIR?) -->
+<div class="modal-bg" id="detailModal" onclick="if(event.target===this) closeModal()">
+  <div class="modal">
+    <div class="modal-head">
+      <div>
+        <h2 id="mTitle" style="font-size:18px;font-weight:800">-</h2>
+        <small id="mSub" style="color:var(--muted)">-</small>
+      </div>
+      <button class="close-btn" onclick="closeModal()">✕</button>
+    </div>
+    <div class="tv-wrap" id="tvContainer"></div>
+    <div id="mLevels" class="levels" style="border-top:none;padding-top:0;margin-bottom:8px"></div>
+    <div id="mExtra" style="font-size:12px;color:var(--muted);line-height:1.5"></div>
+    <div class="slider-box">
+      <div style="display:flex;justify-content:space-between;font-size:12.5px;font-weight:700">
+        <span>🧮 Ne Kazandırır? ($3 komisyon dahil)</span>
+        <span class="blue" id="simAmtLbl">$500</span>
+      </div>
+      <input type="range" id="simSlider" min="100" max="5000" step="50" value="500" oninput="updateSim()" />
+      <div class="sim-grid" id="simGrid"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+let DATA = null;
+let RISK_FILTER = 'all';
+let HORIZON = 'swing_2_3';
+let ACTIVE_STOCK = null;
+
+if (window.Telegram && window.Telegram.WebApp) {
+  try { window.Telegram.WebApp.ready(); window.Telegram.WebApp.expand(); } catch(e){}
+}
+
+function fmt(n) {
+  if (n === null || n === undefined || isNaN(n)) return '-';
+  const v = Number(n);
+  return v >= 100 ? v.toFixed(2) : (v >= 1 ? v.toFixed(3) : v.toFixed(4));
+}
+
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.nav button').forEach(el => el.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
+  document.getElementById('nav-' + name).classList.add('active');
+}
+
+function setRiskFilter(f) {
+  RISK_FILTER = f;
+  ['fAll','fLow','fOrb'].forEach(id => document.getElementById(id).classList.remove('active'));
+  document.getElementById(f==='all'?'fAll':(f==='low'?'fLow':'fOrb')).classList.add('active');
+  renderRockets();
+}
+
+function setHorizon(h) {
+  HORIZON = h;
+  ['hSwing','hDay','hWeek'].forEach(id => document.getElementById(id).classList.remove('active'));
+  document.getElementById(h==='swing_2_3'?'hSwing':(h==='gunluk'?'hDay':'hWeek')).classList.add('active');
+  renderRockets();
+}
+
+function rocketCardHTML(s) {
+  const chgCls = s.change >= 0 ? 'green' : 'red';
+  const scCls = s.score >= 75 ? '' : 'mid';
+  const hz = s.horizons || {};
+  const g = hz.gunluk || {}, sw = hz.swing_2_3 || {}, w = hz.haftalik || {};
+  const tags = [];
+  if (s.orb_breakout) tags.push('🚀 ORB');
+  if (s.oversold_bounce) tags.push('🔄 Dönüş');
+  if (s.rs_leader) tags.push('💪 RS +' + s.rs_vs_ndx + '%');
+  if (s.squeeze_candidate) tags.push('🔥 Squeeze %' + (s.short_float_pct||''));
+  if (s.unusual_opt) tags.push('⚡ Olağandışı CALL');
+  return `
+    <div class="rocket" onclick="openDetail('${s.short}')">
+      <div class="r-top">
+        <div class="r-sym">${s.short} <span class="r-sec">· ${s.sector || 'NASDAQ'}</span></div>
+        <div class="score-badge ${scCls}">${s.score}/100</div>
+      </div>
+      <div class="r-mid">
+        <div class="r-price">$${fmt(s.price)} <span class="${chgCls}" style="font-size:12.5px">(${s.change>=0?'+':''}${s.change}%)</span></div>
+        <div class="r-risk">${s.risk_label || ''}</div>
+      </div>
+      ${tags.length ? `<div class="badges">${tags.map(t=>`<span class="b-tag">${t}</span>`).join('')}</div>` : ''}
+      <div class="hz-row">
+        <div class="hz-box">Günlük <b class="${g.decision==='AL'?'green':(g.decision==='SAT'?'red':'gold')}">${g.decision||'-'} (${g.score||'-'})</b></div>
+        <div class="hz-box">2-3 Gün <b class="${sw.decision==='AL'?'green':(sw.decision==='SAT'?'red':'gold')}">${sw.decision||'-'} (${sw.score||'-'})</b></div>
+        <div class="hz-box">Haftalık <b class="${w.decision==='AL'?'green':(w.decision==='SAT'?'red':'gold')}">${w.decision||'-'} (${w.score||'-'})</b></div>
+      </div>
+      <div class="levels">
+        <span>🛑 Stop <b class="red">$${fmt(s.stop_loss)}</b></span>
+        <span>🎯 TP1 <b class="green">$${fmt(s.tp1)}</b></span>
+        <span>🚀 TP2 <b class="blue">$${fmt(s.tp2)}</b></span>
+      </div>
+    </div>`;
+}
+
+function renderAll() {
+  if (!DATA) return;
+  document.getElementById('updatedTxt').textContent = `Son tarama: ${DATA.updated_tr} TR · ${DATA.total_universe.toLocaleString('tr-TR')} hisse`;
+  const pill = document.getElementById('marketPill');
+  pill.textContent = DATA.market_status || '-';
+  pill.className = 'pill ' + (DATA.market_open ? 'live' : '');
+
+  const reg = DATA.regime || {};
+  document.getElementById('regimePill').textContent = `${reg.label || '-'}${reg.vix ? ' · VIX ' + reg.vix : ''}`;
+
+  const rad = DATA.radar || {};
+  const adv = rad.advancing || 0, dec = rad.declining || 0, tot = Math.max(1, adv + dec);
+  document.getElementById('bUp').style.width = (adv / tot * 100).toFixed(1) + '%';
+  document.getElementById('bDn').style.width = (dec / tot * 100).toFixed(1) + '%';
+  document.getElementById('advTxt').textContent = `🟢 ${adv.toLocaleString('tr-TR')} Yükselen`;
+  document.getElementById('decTxt').textContent = `🔴 ${dec.toLocaleString('tr-TR')} Düşen`;
+
+  const secs = rad.top_sectors || [];
+  document.getElementById('sectorRow').innerHTML = secs.map(([sc, chg]) =>
+    `<div class="sector-chip">🏭 ${sc} <span class="${chg>=0?'green':'red'}">${chg>=0?'+':''}${chg}%</span></div>`
+  ).join('');
+
+  const rockets = DATA.rockets || [];
+  document.getElementById('radarTop3').innerHTML = rockets.slice(0, 3).map(rocketCardHTML).join('') || '<div class="empty">Veri bekleniyor...</div>';
+
+  const movers = DATA.movers || [];
+  document.getElementById('radarMovers').innerHTML = movers.slice(0, 6).map(m => {
+    const vm = m.volume >= 1e6 ? (m.volume/1e6).toFixed(1)+'M' : Math.round(m.volume/1e3)+'K';
+    return `<div class="row-item"><b>${m.symbol}</b><span>$${fmt(m.price)}</span><span class="green" style="font-weight:800">+${m.pct.toFixed(1)}%</span><span style="color:var(--muted);font-size:11.5px">Hacim ${vm}</span></div>`;
+  }).join('') || '<div class="empty">Hareket yok</div>';
+
+  renderRockets();
+  renderKarneAndPortfolio();
+}
+
+function renderRockets() {
+  if (!DATA) return;
+  const q = (document.getElementById('searchBox').value || '').trim().toUpperCase();
+  let list = [...(DATA.rockets || [])];
+  if (RISK_FILTER === 'low') list = list.filter(s => s.risk_level === 'low');
+  if (RISK_FILTER === 'orb') list = list.filter(s => s.orb_breakout || s.oversold_bounce);
+  if (q) list = list.filter(s => s.short.includes(q) || (s.sector||'').toUpperCase().includes(q));
+  list.sort((a, b) => ((b.horizons||{})[HORIZON]?.score || b.score) - ((a.horizons||{})[HORIZON]?.score || a.score));
+  document.getElementById('rocketsList').innerHTML = list.map(rocketCardHTML).join('') || '<div class="empty">Filtreye uyan hisse bulunamadı.</div>';
+}
+
+function renderKarneAndPortfolio() {
+  const p = DATA.paper;
+  if (!p) {
+    document.getElementById('karneKpis').innerHTML = '<div class="empty">Sanal portföy verisi henüz oluşmadı.</div>';
+    return;
+  }
+  const st = p.stats || {};
+  const retCls = p.return_pct >= 0 ? 'green' : 'red';
+  document.getElementById('karneKpis').innerHTML = `
+    <div class="kpi"><div class="lbl">Net Varlık</div><div class="val">$${p.equity.toFixed(2)}</div><div class="sub ${retCls}">${p.return_pct>=0?'+':''}${p.return_pct}%</div></div>
+    <div class="kpi"><div class="lbl">Kazanma Oranı</div><div class="val blue">${st.win_rate!==null && st.win_rate!==undefined ? '%'+st.win_rate : '-'}</div><div class="sub">${st.closed_count||0} kapanan işlem</div></div>
+    <div class="kpi"><div class="lbl">Toplam Komisyon</div><div class="val red">-$${(p.total_commissions_usd||0).toFixed(2)}</div><div class="sub">$1.50 / emir dahil</div></div>
+    <div class="kpi"><div class="lbl">Maks. Düşüş</div><div class="val gold">-%${st.max_drawdown_pct||0}</div><div class="sub">PF: ${st.profit_factor||'-'}</div></div>
+  `;
+
+  const closed = p.closed || [];
+  document.getElementById('karneClosed').innerHTML = closed.slice(0, 12).map(c =>
+    `<div class="row-item"><div><b>${c.short}</b> <small style="color:var(--muted)">(${c.reason})</small></div><div class="${c.pnl_usd>=0?'green':'red'}" style="font-weight:800">${c.pnl_usd>=0?'+':''}$${c.pnl_usd.toFixed(2)} (${c.pnl_pct>=0?'+':''}${c.pnl_pct}%)</div></div>`
+  ).join('') || '<div class="empty">Henüz kapanan işlem yok.</div>';
+
+  const byTag = {};
+  closed.forEach(c => (c.tags||[]).forEach(tg => {
+    if (!byTag[tg]) byTag[tg] = { n: 0, w: 0, pnl: 0 };
+    byTag[tg].n++; if (c.pnl_usd > 0) byTag[tg].w++; byTag[tg].pnl += c.pnl_usd;
+  }));
+  const tagRows = Object.entries(byTag).sort((a,b)=>b[1].pnl-a[1].pnl);
+  document.getElementById('karneBadges').innerHTML = tagRows.map(([tg, d]) =>
+    `<div class="row-item"><b>${tg}</b><span>${d.n} işlem · %${Math.round(d.w/d.n*100)}</span><b class="${d.pnl>=0?'green':'red'}">${d.pnl>=0?'+':''}$${d.pnl.toFixed(2)}</b></div>`
+  ).join('') || '<div class="empty">Rozet istatistiği yeni işlemler kapandıkça dolacak.</div>';
+
+  document.getElementById('portKpis').innerHTML = `
+    <div class="kpi"><div class="lbl">Toplam Varlık</div><div class="val">$${p.equity.toFixed(2)}</div><div class="sub ${retCls}">${p.return_pct>=0?'+':''}${p.return_pct}% net</div></div>
+    <div class="kpi"><div class="lbl">Serbest Nakit</div><div class="val blue">$${p.cash.toFixed(2)}</div><div class="sub">Rezerve: $${p.reserved.toFixed(2)}</div></div>
+  `;
+  const openPos = p.positions || [];
+  document.getElementById('portOpen').innerHTML = openPos.map(pos =>
+    `<div class="row-item">
+      <div><b>${pos.short}</b> <small style="color:var(--muted)">$${fmt(pos.avg_entry)} → $${fmt(pos.price)}</small><br><small style="color:var(--muted)">Stop $${fmt(pos.stop)} · TP1 $${fmt(pos.tp1)}</small></div>
+      <div class="${pos.pnl_usd>=0?'green':'red'}" style="text-align:right;font-weight:800">${pos.pnl_usd>=0?'+':''}$${pos.pnl_usd.toFixed(2)}<br><small>${pos.pnl_pct>=0?'+':''}${pos.pnl_pct}%</small></div>
+    </div>`
+  ).join('') || '<div class="empty">Şu an açık pozisyon yok.</div>';
+}
+
+function openDetail(sym) {
+  const s = (DATA.rockets || []).find(x => x.short === sym);
+  if (!s) return;
+  ACTIVE_STOCK = s;
+  document.getElementById('mTitle').textContent = `${s.short} — $${fmt(s.price)} (${s.change>=0?'+':''}${s.change}%)`;
+  document.getElementById('mSub').textContent = `${s.sector || 'NASDAQ'} · Skor ${s.score}/100 · ${s.risk_label || ''}`;
+  document.getElementById('mLevels').innerHTML = `
+    <span>🛑 Stop <b class="red">$${fmt(s.stop_loss)}</b></span>
+    <span>⚡ Kırılım <b class="gold">$${fmt(s.breakout)}</b></span>
+    <span>🎯 TP1 <b class="green">$${fmt(s.tp1)}</b></span>
+    <span>🚀 TP2 <b class="blue">$${fmt(s.tp2)}</b></span>
+  `;
+  document.getElementById('mExtra').innerHTML =
+    (s.options ? `<div>📊 ${s.options}</div>` : '') +
+    (s.latest_news ? `<div>📰 ${s.latest_news}</div>` : '') +
+    (s.summary ? `<div style="margin-top:4px">🧠 ${s.summary}</div>` : '');
+
+  // Canlı TradingView Widget
+  document.getElementById('tvContainer').innerHTML = `
+    <iframe src="https://s.tradingview.com/widgetembed/?symbol=NASDAQ:${encodeURIComponent(s.short)}&interval=15&theme=dark&style=1&locale=tr&hide_top_toolbar=1&saveimage=0"
+      style="width:100%;height:100%;border:0" allowtransparency="true" frameborder="0"></iframe>`;
+
+  updateSim();
+  document.getElementById('detailModal').classList.add('open');
+}
+
+function closeModal() {
+  document.getElementById('detailModal').classList.remove('open');
+  document.getElementById('tvContainer').innerHTML = '';
+}
+
+function updateSim() {
+  if (!ACTIVE_STOCK) return;
+  const amt = Number(document.getElementById('simSlider').value);
+  document.getElementById('simAmtLbl').textContent = `$${amt}`;
+  const comm = 1.50, fee = 0.0005;
+  const qty = Math.max(0.001, amt - comm - amt * fee) / ACTIVE_STOCK.price;
+  const calc = (tp) => {
+    const gross = qty * tp;
+    const pnl = Math.max(0, gross - comm - gross * fee) - amt;
+    return { pnl, pct: (pnl / amt * 100) };
+  };
+  const st = calc(ACTIVE_STOCK.stop_loss), t1 = calc(ACTIVE_STOCK.tp1), t2 = calc(ACTIVE_STOCK.tp2);
+  document.getElementById('simGrid').innerHTML = `
+    <div class="sim-cell">🛑 Stop<b class="red">${st.pnl>=0?'+':''}$${st.pnl.toFixed(1)}</b><small>${st.pct.toFixed(1)}%</small></div>
+    <div class="sim-cell">🎯 TP1<b class="green">+$${t1.pnl.toFixed(1)}</b><small>+${t1.pct.toFixed(1)}%</small></div>
+    <div class="sim-cell">🚀 TP2<b class="blue">+$${t2.pnl.toFixed(1)}</b><small>+${t2.pct.toFixed(1)}%</small></div>
+  `;
+}
+
+async function loadData() {
+  const urls = [
+    './dashboard_data.json?t=' + Date.now(),
+    'https://raw.githubusercontent.com/tasdemirdeniz08-wq/NasdaqBot/main/dashboard_data.json?t=' + Date.now()
+  ];
+  for (const u of urls) {
+    try {
+      const r = await fetch(u);
+      if (r.ok) { DATA = await r.json(); renderAll(); return; }
+    } catch(e) {}
+  }
+  document.getElementById('updatedTxt').textContent = 'Henüz dashboard_data.json oluşmadı (ilk tarama bekleniyor)';
+}
+loadData();
+setInterval(loadData, 120000);
+</script>
+</body>
+</html>

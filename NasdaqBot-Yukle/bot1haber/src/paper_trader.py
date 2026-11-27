@@ -206,6 +206,7 @@ def _close_position(st, pos, price, fx, reason, now, events):
         "invested_usd": round(invested, 2), "pnl_usd": round(pnl, 2),
         "pnl_pct": round(pnl_pct, 2), "r": round(r_mult, 2),
         "reason": reason, "tp_hit": pos["tp_hit"],
+        "tags": pos.get("tags", []),
     })
     st["positions"] = [p for p in st["positions"] if p["id"] != pos["id"]]
     _cancel_plan_for_symbol(st, pos["symbol"])
@@ -325,7 +326,7 @@ def _process_plans(st, prices, fx, now, events):
                     "currency": cur, "tv_symbol": plan.get("tv_symbol", ""),
                     "score": plan["score"], "opened": int(now), "qty": 0.0, "orig_qty": 0.0,
                     "cost_local": 0.0, "invested_usd": 0.0, "proceeds_usd": 0.0,
-                    "commissions_usd": 0.0,
+                    "commissions_usd": 0.0, "tags": plan.get("tags", []),
                     "avg_entry": 0.0, "stop": plan["stop"], "stop0": plan["stop"],
                     "tp1": plan["tp1"], "tp2": plan["tp2"], "tp3": plan["tp3"], "tp_hit": 0,
                 }
@@ -407,13 +408,27 @@ def _create_plans(st, setups, fx, now, events, regime_scale=1.0):
         if budget < 80:
             continue
 
+        tags = []
+        if s.get("orb_breakout"):
+            tags.append("🚀ORB")
+        if s.get("oversold_bounce"):
+            tags.append("🔄Dönüş")
+        if s.get("squeeze_candidate"):
+            tags.append("🔥Squeeze")
+        if s.get("rs_leader"):
+            tags.append("💪RS-Lider")
+        if (s.get("options") or {}).get("score_delta", 0) > 0:
+            tags.append("⚡Opsiyon")
+        if s.get("score", 0) >= 90:
+            tags.append("🎯Skor90+")
+
         st["seq"] += 1
         pid = f"P{st['seq']}"
         ttl = PLAN_TTL_CRYPTO if s["category"] == "KRİPTO" else PLAN_TTL_DEFAULT
         plan = {
             "id": pid, "symbol": sym, "short": s["short"], "category": s["category"],
             "sector": sec, "currency": cur, "tv_symbol": s.get("tv_symbol", ""), "score": s["score"],
-            "created": int(now), "expires": int(now + ttl), "price_at_plan": price,
+            "tags": tags, "created": int(now), "expires": int(now + ttl), "price_at_plan": price,
             "stop": stop, "tp1": s["tp1"], "tp2": s["tp2"], "tp3": s["tp3"],
             "reserved": round(budget, 4), "budget": round(budget, 2),
             "tiers": [
@@ -613,6 +628,74 @@ def build_report(weekly=False):
         st = load_state()
     fx = st.get("fx") or _get_fx(st) or 1
     return _summary_text(st, fx, weekly=weekly)
+
+
+def build_scorecard():
+    """OPT tarzı şeffaf Sinyal Karnesi (/karne): Kazanma oranı, Rekor Hisseler ve Rozet Bazlı Performans."""
+    with _lock:
+        st = load_state()
+    fx = st.get("fx") or _get_fx(st) or 1
+    eq = _equity(st, fx)
+    stats = compute_stats(st)
+    ret_pct = (eq / st["initial"] - 1.0) * 100.0 if st["initial"] else 0.0
+    wr = f"%{stats['win_rate']}" if stats["win_rate"] is not None else "Henüz yok"
+    pf = f"{stats['profit_factor']}" if stats["profit_factor"] is not None else "-"
+    tot_comm = st.get("total_commissions_usd", 0.0)
+
+    lines = [
+        "🏆 *NASDAQ BOT SİNYAL KARNESİ (ŞEFFAF RAPOR)*",
+        f"💰 Net Varlık: `{eq:.2f}$` (`{ret_pct:+.2f}%`) | 💸 Komisyon: `-{tot_comm:.2f}$`",
+        f"📊 Kapanan İşlem: `{stats['closed_count']}` | Kazanma Oranı: `{wr}` | Profit Factor: `{pf}`",
+        f"📉 Maks. Düşüş (Drawdown): `-%{stats['max_drawdown_pct']}`",
+    ]
+
+    # Rekor Kıran İşlemler (kapanan en iyi 5)
+    closed = st.get("closed", [])
+    winners = sorted([c for c in closed if c.get("pnl_usd", 0) > 0], key=lambda x: -x.get("pnl_pct", 0))
+    if winners:
+        lines.append("\n🚀 *Rekor Kıran Kapanan İşlemler:*")
+        for w in winners[:5]:
+            c = w.get("currency", "$")
+            lines.append(
+                f"• *{w['short']}* `{_fmt(w['avg_entry'], c)}` → `{_fmt(w['exit_price'], c)}` "
+                f"(`{w['pnl_pct']:+.1f}%` · `{w['pnl_usd']:+.2f}$` · {w['reason']})"
+            )
+
+    # Açık Pozisyonların Anlık Durumu
+    if st["positions"]:
+        lines.append("\n📈 *Açık Pozisyonlar (Canlı):*")
+        for pos in st["positions"]:
+            c = pos["currency"]
+            p = st["last_prices"].get(pos["symbol"], pos["avg_entry"])
+            val = _to_usd(pos["qty"] * p, c, fx or 1)
+            pnl = val + pos["proceeds_usd"] - pos["invested_usd"]
+            pct = (pnl / pos["invested_usd"] * 100.0) if pos["invested_usd"] else 0.0
+            icon = "🟢" if pnl >= 0 else "🔴"
+            lines.append(f"{icon} *{pos['short']}* `{_fmt(pos['avg_entry'], c)}` → `{_fmt(p, c)}` (`{pct:+.1f}%` · `{pnl:+.2f}$`)")
+
+    # Rozet Bazlı Performans (hangi sinyal gerçekten para kazandırıyor?)
+    by_tag = {}
+    for cl in closed:
+        for tg in cl.get("tags", []):
+            d = by_tag.setdefault(tg, {"n": 0, "wins": 0, "pnl": 0.0})
+            d["n"] += 1
+            d["wins"] += 1 if cl.get("pnl_usd", 0) > 0 else 0
+            d["pnl"] += cl.get("pnl_usd", 0)
+    if by_tag:
+        lines.append("\n🧠 *Rozet Bazlı Sinyal Performansı:*")
+        for tg, d in sorted(by_tag.items(), key=lambda kv: -kv[1]["pnl"]):
+            twr = round(d["wins"] / d["n"] * 100.0, 0)
+            lines.append(f"• {tg}: `{d['n']}` işlem | Kazanma `%{twr:.0f}` | Net `{d['pnl']:+.2f}$`")
+
+    # Son Kapananlar (kayıplar dahil şeffaf)
+    if closed:
+        lines.append("\n📋 *Son 5 Kapanan İşlem:*")
+        for cl in closed[-5:]:
+            ic = "✅" if cl["pnl_usd"] >= 0 else "🔻"
+            lines.append(f"{ic} *{cl['short']}* ({cl['reason']}): `{cl['pnl_usd']:+.2f}$` (`{cl['pnl_pct']:+.1f}%`)")
+
+    lines.append("\n_Gerçek $1.50/emir komisyon + kayma dahil sanal karne. Yatırım tavsiyesi değildir._")
+    return "\n".join(lines)
 
 
 def process_scan(setups, notify=None, now=None, market_open=True, regime_scale=1.0):

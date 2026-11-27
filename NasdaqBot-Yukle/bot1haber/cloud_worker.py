@@ -139,12 +139,22 @@ def send_chart_with_ai(setup, regime_label="NÖTR", chat_id=None):
     ai_txt = chart_ai.generate_ai_commentary(setup, regime_label=regime_label)
     c = setup["currency"]
     vwap_s = f" | VWAP `{c}{setup['vwap']}`" if setup.get("vwap") else ""
+    risk_lbl = setup.get("risk_label", "")
+    hz = setup.get("horizons") or {}
+    hz_line = ""
+    if hz:
+        g, s2, h = hz.get("gunluk", {}), hz.get("swing_2_3", {}), hz.get("haftalik", {})
+        hz_line = (
+            f"\n🚀 *3 Vade:* Günlük `{g.get('decision','-')} ({g.get('score','-')})` · "
+            f"2-3 Gün `{s2.get('decision','-')} ({s2.get('score','-')})` · "
+            f"Haftalık `{h.get('decision','-')} ({h.get('score','-')})`"
+        )
     earn_s = "\n⚠️ *UYARI: Yakın bilanço tarihi riski!*" if setup.get("earnings_warning") else ""
     caption = (
-        f"📊 *{setup['short']}* — Skor `{setup['score']}/100` ({setup['decision']})\n"
+        f"📊 *{setup['short']}* — Skor `{setup['score']}/100` ({setup['decision']}) | {risk_lbl}\n"
         f"💰 Fiyat: `{c}{setup['price']}` ({setup['change']:+.2f}%){vwap_s}\n"
         f"⚡ Kırılım: `{c}{setup['breakout']}` | 🛡️ Destek: `{c}{setup['entry_1']}`\n"
-        f"🛑 Stop: `{c}{setup['stop_loss']}` (-%{setup['risk_pct']}) | 🎯 TP1 `{c}{setup['tp1']}` / TP2 `{c}{setup['tp2']}`{earn_s}\n\n"
+        f"🛑 Stop: `{c}{setup['stop_loss']}` (-%{setup['risk_pct']}) | 🎯 TP1 `{c}{setup['tp1']}` / TP2 `{c}{setup['tp2']}`{hz_line}{earn_s}\n\n"
         f"🤖 *AI Analizi:*\n{ai_txt}\n\n"
         f"_Yatırım tavsiyesi değildir._"
     )
@@ -210,17 +220,192 @@ def build_gap_message(gappers, market_status):
     return "\n".join(lines)
 
 
+def build_calculator_message(setup, amount_usd):
+    """OPT tarzı 'Ne Kazandırır?' (/hesap NVDA 500) net kazanç/kayıp simülatörü ($1.50 komisyon dahil)."""
+    price = float(setup["price"])
+    comm = float(os.getenv("PAPER_COMMISSION_USD", "1.50"))
+    fee = float(os.getenv("PAPER_FEE_RATE", "0.0005"))
+    net_in = max(1.0, amount_usd - comm - amount_usd * fee)
+    qty = net_in / price
+
+    def _sim(target_p):
+        gross = qty * target_p
+        net_out = max(0.0, gross - comm - gross * fee)
+        pnl = net_out - amount_usd
+        pct = (pnl / amount_usd) * 100.0 if amount_usd > 0 else 0.0
+        return pnl, pct
+
+    st_pnl, st_pct = _sim(setup["stop_loss"])
+    tp1_pnl, tp1_pct = _sim(setup["tp1"])
+    tp2_pnl, tp2_pct = _sim(setup["tp2"])
+    tp3_pnl, tp3_pct = _sim(setup["tp3"])
+    c = setup["currency"]
+    return (
+        f"🧮 *NE KAZANDIRIR? — {setup['short']}* (`{amount_usd:.0f}$` yatırım)\n"
+        f"💰 Giriş: `{c}{price}` | Alınan Adet: `{qty:.3f}` | {setup.get('risk_label', '')}\n"
+        f"💸 Alış+Satış Komisyonu: `~{comm*2:.2f}$` (net hesaba dahil)\n\n"
+        f"🛑 *Stop (`{c}{setup['stop_loss']}`):* `{st_pnl:+.2f}$` (`{st_pct:+.1f}%`)\n"
+        f"🎯 *TP1 (`{c}{setup['tp1']}`):* `{tp1_pnl:+.2f}$` (`{tp1_pct:+.1f}%`)\n"
+        f"🎯 *TP2 (`{c}{setup['tp2']}`):* `{tp2_pnl:+.2f}$` (`{tp2_pct:+.1f}%`)\n"
+        f"🚀 *TP3 (`{c}{setup['tp3']}`):* `{tp3_pnl:+.2f}$` (`{tp3_pct:+.1f}%`)\n\n"
+        f"_Simülasyondur, yatırım tavsiyesi değildir._"
+    )
+
+
+def build_tuyo_check_caption(setup, regime_label="NÖTR"):
+    """OPT 'Yalan Makinesi' tarzı 5 noktalı Tüyo Kontrolü (/tuyo SEMBOL)."""
+    checks = []
+    red_flags = 0
+    green_flags = 0
+
+    if setup["score"] >= 70:
+        checks.append(f"✅ Trend & Teknik güçlü (`{setup['score']}/100`)")
+        green_flags += 2
+    elif setup["score"] >= 50:
+        checks.append(f"🟡 Teknik kararsız (`{setup['score']}/100`)")
+    else:
+        checks.append(f"🚨 Teknik zayıf / düşüş trendi (`{setup['score']}/100`)")
+        red_flags += 2
+
+    if setup.get("vol_ratio", 1.0) >= 1.2:
+        checks.append(f"✅ Hacim teyitli (`{setup['vol_ratio']}x`)")
+        green_flags += 1
+    else:
+        checks.append(f"🟡 Hacim zayıf (`{setup.get('vol_ratio', 1.0)}x`)")
+
+    if setup["price"] < 2.0 or (setup.get("dollar_vol", 0) > 0 and setup["dollar_vol"] < 1_000_000):
+        checks.append("🚨 Sığ / ucuz hisse (manipülasyon riski yüksek)")
+        red_flags += 2
+    else:
+        checks.append("✅ Likidite yeterli")
+        green_flags += 1
+
+    if setup.get("change", 0) > 35.0 or setup.get("rsi", 50) > 80:
+        checks.append(f"🚨 Aşırı şişmiş / FOMO tepesi (`{setup['change']:+.1f}%`, RSI `{setup['rsi']}`)")
+        red_flags += 2
+    else:
+        checks.append(f"✅ FOMO tepesinde değil (RSI `{setup.get('rsi', 50)}`)")
+
+    if setup.get("earnings_warning"):
+        checks.append("🚨 Yakın bilanço tuzağı (gece -%20 gap riski)")
+        red_flags += 2
+    else:
+        checks.append("✅ Yakın bilanço riski yok")
+
+    if red_flags >= 3:
+        verdict = "🚨 TUZAK / DİKKAT (Tüyo riskli görünüyor)"
+    elif green_flags >= 3 and red_flags == 0:
+        verdict = "✅ GERÇEK FIRSAT (Veriler tüyoyu destekliyor)"
+    else:
+        verdict = "🟡 ŞÜPHELİ / ACELE ETME (Teyit bekle)"
+
+    c = setup["currency"]
+    return (
+        f"🕵️ *TÜYO KONTROLÜ (YALAN MAKİNESİ) — {setup['short']}*\n"
+        f"Karar: *{verdict}*\n"
+        f"💰 Fiyat: `{c}{setup['price']}` ({setup['change']:+.2f}%) | {setup.get('risk_label', '')}\n\n"
+        + "\n".join(checks)
+        + f"\n\n🛑 Stop: `{c}{setup['stop_loss']}` | 🎯 TP1: `{c}{setup['tp1']}`\n"
+        f"_Algoritmik teyittir, yatırım tavsiyesi değildir._"
+    )
+
+
+def export_dashboard_json(setups, market_open, market_status, regime, paper_trader_mod=None):
+    """GitHub Pages Mobil Web / Telegram Mini App için canlı dashboard_data.json dosyasını üretir."""
+    try:
+        paper_file = os.getenv("PAPER_STATE_FILE", "")
+        default_dir = os.path.dirname(paper_file) if paper_file else os.path.dirname(os.path.abspath(__file__))
+        out_path = os.getenv("DASHBOARD_DATA_FILE", os.path.join(default_dir, "dashboard_data.json"))
+        radar = server.get_market_radar()
+        dash = paper_trader_mod.get_dashboard() if paper_trader_mod else None
+
+        rockets = []
+        for s in setups[:25]:
+            rockets.append({
+                "symbol": s["symbol"], "short": s["short"], "sector": s.get("sector", "NASDAQ"),
+                "price": s["price"], "change": s["change"], "score": s["score"],
+                "decision": s["decision"], "rsi": s["rsi"], "vol_ratio": s["vol_ratio"],
+                "atr_pct": s.get("atr_pct", 0), "vwap": s.get("vwap"),
+                "breakout": s["breakout"], "support_1": s["support_1"],
+                "stop_loss": s["stop_loss"], "risk_pct": s["risk_pct"],
+                "tp1": s["tp1"], "tp2": s["tp2"], "tp3": s["tp3"],
+                "risk_score": s.get("risk_score", 50), "risk_label": s.get("risk_label", "🟡 Orta Risk"),
+                "risk_level": s.get("risk_level", "medium"),
+                "rs_vs_ndx": s.get("rs_vs_ndx", 0), "rs_leader": bool(s.get("rs_leader")),
+                "orb_breakout": bool(s.get("orb_breakout")),
+                "oversold_bounce": bool(s.get("oversold_bounce")),
+                "squeeze_candidate": bool(s.get("squeeze_candidate")),
+                "short_float_pct": s.get("short_float_pct"),
+                "earnings_warning": bool(s.get("earnings_warning")),
+                "tradeable": bool(s.get("tradeable", True)),
+                "horizons": s.get("horizons", {}),
+                "options": (s.get("options") or {}).get("summary", ""),
+                "unusual_opt": bool((s.get("options") or {}).get("unusual")),
+                "latest_news": s.get("latest_news", ""),
+                "summary": s.get("summary", ""),
+            })
+
+        payload = {
+            "updated_tr": datetime.now(TR_TZ).strftime("%d.%m.%Y %H:%M"),
+            "updated_ts": int(time.time()),
+            "market_open": bool(market_open),
+            "market_status": market_status,
+            "regime": regime,
+            "total_universe": server.LIVE_MOVERS_CACHE.get("total_universe", 0) or len(setups),
+            "scanned_count": len(setups),
+            "radar": radar,
+            "rockets": rockets,
+            "movers": server.get_live_nasdaq_movers(limit=10),
+            "gappers": server.get_premarket_gappers(limit=10),
+            "paper": dash,
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        print(f"dashboard_data.json yazıldı: {out_path}")
+    except Exception as e:
+        print(f"dashboard_data.json hata: {e}")
+
+
+def build_low_risk_rockets_message(setups):
+    lows = [s for s in setups if s.get("risk_level") == "low" and s.get("tradeable", True)]
+    if not lows:
+        lows = [s for s in setups if s.get("risk_level") != "high" and s.get("tradeable", True)]
+    if not lows:
+        return "🛡️ *DÜŞÜK RİSKLİ ROKETLER*\nŞu an düşük risk kriterine uyan aday bulunamadı."
+    lines = ["🛡️ *DÜŞÜK RİSKLİ EN İYİ 5 ROKET HİSSE*\n"]
+    for i, s in enumerate(lows[:5], 1):
+        c = s["currency"]
+        hz = s.get("horizons") or {}
+        hz_s = f" | G:`{hz.get('gunluk',{}).get('score','-')}` 2-3G:`{hz.get('swing_2_3',{}).get('score','-')}` H:`{hz.get('haftalik',{}).get('score','-')}`" if hz else ""
+        lines.append(
+            f"*{i}. {s['short']}* — Skor `{s['score']}/100` | {s.get('risk_label','')}{hz_s}\n"
+            f"   💰 `{c}{s['price']}` ({s['change']:+.2f}%) | 🛑 Stop `{c}{s['stop_loss']}` (-%{s['risk_pct']}) | 🎯 TP1 `{c}{s['tp1']}`"
+        )
+    lines.append("\n💡 Detaylı grafik: `/analiz SEMBOL` · Kazanç hesabı: `/hesap SEMBOL 500`")
+    return "\n".join(lines)
+
+
 def build_15min_bulletin(setups, market_open, market_status, regime, paper_summary=None):
     tr_now = datetime.now(TR_TZ).strftime("%H:%M")
     total_u = server.LIVE_MOVERS_CACHE.get("total_universe", 0) or len(setups)
     vix_s = f" | VIX: `{regime['vix']}`" if regime.get("vix") else ""
+    radar = server.get_market_radar()
+    radar_lines = []
+    if radar.get("advancing") or radar.get("declining"):
+        radar_lines.append(f"📡 Piyasa Genişliği: `🟢 {radar['advancing']:,}` Yükselen / `🔴 {radar['declining']:,}` Düşen")
+    if radar.get("top_sectors"):
+        sec_str = " · ".join(f"{sc} `{chg:+.1f}%`" for sc, chg in radar["top_sectors"])
+        radar_lines.append(f"🏭 Lider Sektörler: {sec_str}")
+
     lines = [
-        f"⏱️ *NASDAQ CANLI BÜLTEN ({tr_now} TR)*",
+        f"⏱️ *NASDAQ CANLI RADAR & ROKETLER ({tr_now} TR)*",
         f"🏛️ Borsa: `{market_status}` | Rejim: *{regime['label']}*{vix_s}",
-        f"🔎 Evren: `{total_u:,}` NASDAQ hissesi | Derin Analiz: `{len(setups)}` hisse\n",
-        "🏆 *GÜNLÜK AL-SAT EN İYİ 5 ADAY:*",
+        f"🔎 Evren: `{total_u:,}` NASDAQ hissesi | Derin Analiz: `{len(setups)}` hisse",
     ]
-    # Otomatik işlem kalitesini sağlayanları (fiyat>=$3, likit) öne çıkar
+    lines.extend(radar_lines)
+    lines.append("\n🚀 *EN İYİ 5 ROKET ADAYI (3 VADE + RİSK):*")
+
     tradeable = [s for s in setups if s.get("tradeable", True)]
     picks = (tradeable[:5] if len(tradeable) >= 5 else setups[:5])
     for i, s in enumerate(picks, 1):
@@ -231,15 +416,20 @@ def build_15min_bulletin(setups, market_open, market_status, regime, paper_summa
             badges.append("🚀ORB")
         if s.get("oversold_bounce"):
             badges.append("🔄Dönüş")
+        if s.get("rs_leader"):
+            badges.append("💪RS")
         if s.get("squeeze_candidate"):
             badges.append(f"🔥Squeeze %{s.get('short_float_pct')}")
         if (s.get("options") or {}).get("unusual"):
             badges.append("⚡Olağandışı CALL")
         badge_s = (" · " + " ".join(badges)) if badges else ""
+        hz = s.get("horizons") or {}
+        hz_s = f" | 3V: G`{hz.get('gunluk',{}).get('score','-')}`/2-3G`{hz.get('swing_2_3',{}).get('score','-')}`/H`{hz.get('haftalik',{}).get('score','-')}`" if hz else ""
+        risk_lbl = s.get("risk_label", "")
         opt_txt = f"\n   📊 {s['options']['summary']}" if s.get("options") and s["options"].get("summary") else ""
         lines.append(
-            f"*{i}. {s['short']}* ({s.get('sector', 'NASDAQ')}) — Skor `{s['score']}/100` ({s['decision']}){badge_s}\n"
-            f"   💰 `{c}{s['price']}` ({s['change']:+.2f}%){vwap_s} | ⚡ Kırılım `{c}{s['breakout']}`\n"
+            f"*{i}. {s['short']}* ({s.get('sector', 'NASDAQ')}) — Skor `{s['score']}/100` · {risk_lbl}{badge_s}\n"
+            f"   💰 `{c}{s['price']}` ({s['change']:+.2f}%){vwap_s}{hz_s}\n"
             f"   🛑 Stop `{c}{s['stop_loss']}` (-%{s['risk_pct']}) | 🎯 TP1 `{c}{s['tp1']}` / TP2 `{c}{s['tp2']}`{opt_txt}"
         )
 
@@ -267,25 +457,28 @@ def build_15min_bulletin(setups, market_open, market_status, regime, paper_summa
             f"💸 Komisyon: `-{paper_summary['commissions']:.2f}$`"
         )
 
-    lines.append("\n💬 `/analiz XLAB` (Grafik+AI) · `/ekle XLAB` · `/alarm XLAB 2.00` · `/sanal` · `/help`")
+    lines.append("\n💬 `/analiz NVDA` · `/karne` · `/hesap NVDA 500` · `/dusukrisk` · `/help`")
     lines.append("_Yatırım tavsiyesi değildir._")
     return "\n".join(lines)
 
 
 def build_help_message():
     return (
-        "🤖 *NASDAQ BOT KOMUT LİSTESİ (7/24 Bulut)*\n\n"
-        "• `/analiz XLAB` veya `/grafik NVDA` — Mum grafiği (PNG) + Groq AI analizi + kırılım/stop/TP\n"
-        "• `/durum` — Borsa saati, piyasa rejimi (NDX/VIX), son tarama ve net kâr/zarar\n"
+        "🤖 *NASDAQ BOT KOMUT LİSTESİ (OPT Tarzı · 7/24 Bulut)*\n\n"
+        "• `/analiz XLAB` veya `/grafik NVDA` — Mum grafiği (PNG) + 3 Vade + Risk + Groq AI analizi\n"
+        "• `/karne` — Şeffaf Sinyal Karnesi (kazanma oranı, rekor hisseler, rozet performansı)\n"
+        "• `/tuyo XLAB` — 🕵️ Tüyo Kontrolü (Yalan Makinesi: grafik + 5 noktalı tuzak analizi)\n"
+        "• `/hesap NVDA 500` — \"Ne Kazandırır?\" net kazanç/kayıp hesaplayıcı (komisyon dahil)\n"
+        "• `/dusukrisk` veya `/roket` — Sadece 🟢 Düşük Riskli en iyi 5 Roket hisse\n"
+        "• `/durum` — Borsa saati, piyasa rejimi, yükselen/düşen dengesi ve net kâr\n"
         "• `/sanal` veya `/rapor` — 1500$ sanal portföy + komisyon dökümü\n"
         "• `/haftalik` — Haftalık performans raporu\n"
-        "• `/oneriler` — En iyi 5 günlük al-sat adayı\n"
+        "• `/oneriler` — En iyi 5 Roket hisse önerisi\n"
         "• `/yukselenler` — 4.300+ NASDAQ içinde günün sert yükselenleri\n"
-        "• `/gap` — Pre-Market / Açılış gap adayları ($3+, +%4 ve üstü)\n"
+        "• `/gap` — Pre-Market / Açılış gap adayları\n"
         "• `/ekle XLAB` / `/sil XLAB` / `/liste` — Kişisel takip listen\n"
-        "• `/alarm XLAB 2.00` — Fiyat alarmı kur (hedef geçilince anında uyarır)\n"
-        "• `/help` — Bu yardım menüsü\n\n"
-        "ℹ️ _Not: Bulut tarayıcı 15 dakikalık periyotlarla çalışır; borsa kapalıyken sessiz moda (2 saatte bir özet) geçer, komutlarını ise her turda yanıtlar._"
+        "• `/alarm XLAB 2.00` — Fiyat alarmı kur\n"
+        "• `/help` — Bu yardım menüsü"
     )
 
 
@@ -398,6 +591,24 @@ def process_telegram_commands(state, setups, market_open, market_status, regime,
             reply = build_status_message(setups, market_status, regime, dash)
         elif cmd in ("/sanal", "/rapor", "/portfoy"):
             reply = paper_trader_mod.build_report(weekly=False) if paper_trader_mod else "Sanal portföy kapalı."
+        elif cmd in ("/karne", "/rekor", "/performans"):
+            reply = paper_trader_mod.build_scorecard() if paper_trader_mod else "Karne verisi yok."
+        elif cmd in ("/dusukrisk", "/roket", "/roketler"):
+            reply = build_low_risk_rockets_message(setups)
+        elif cmd in ("/hesap", "/hesapla", "/kazanc"):
+            try:
+                amt = float(arg2) if arg2 else 500.0
+                if not arg or not arg.isalpha() or amt <= 0:
+                    raise ValueError
+                found = next((s for s in setups if s["short"] == arg or s["symbol"] == arg), None)
+                if not found:
+                    found = server.analyze_single_symbol(arg, enrich=False)
+                if found:
+                    reply = build_calculator_message(found, amt)
+                else:
+                    reply = f"❌ `{arg}` bulunamadı. Örnek: `/hesap NVDA 500`"
+            except Exception:
+                reply = "Kullanım: `/hesap NVDA 500` (hisse + yatırım tutarı $)"
         elif cmd == "/haftalik":
             reply = paper_trader_mod.build_report(weekly=True) if paper_trader_mod else "Sanal portföy kapalı."
         elif cmd in ("/oneriler", "/top5", "/sniper"):
@@ -457,6 +668,31 @@ def process_telegram_commands(state, setups, market_open, market_status, regime,
                 reply = f"🔔 Alarm kuruldu: *{arg}* `${target:.3f}` {dir_lbl} bildirim gelecek (anlık: `${cur_p}`)."
             except Exception:
                 reply = "Kullanım: `/alarm XLAB 2.00`"
+        elif cmd in ("/tuyo", "/yalan", "/kontrol"):
+            if not arg:
+                reply = "Kullanım: `/tuyo XLAB` (birinden duyduğun hisseyi 5 noktada test eder)"
+            else:
+                found = next((s for s in setups if s["short"] == arg or s["symbol"] == arg), None)
+                if not found:
+                    found = server.analyze_single_symbol(arg, enrich=True)
+                if found:
+                    df = server.LAST_DF_CACHE.get(found["symbol"]) or server._fetch_yfinance_ohlcv(found["symbol"])
+                    cap = build_tuyo_check_caption(found, regime_label=regime["label"])
+                    png_path = chart_ai.render_setup_chart(df, found)
+                    if png_path:
+                        send_telegram_photo(png_path, caption=cap, chat_id=msg_chat_id)
+                        try:
+                            if not DRY_RUN:
+                                os.remove(png_path)
+                        except Exception:
+                            pass
+                    else:
+                        send_telegram(cap, chat_id=msg_chat_id)
+                    handled += 1
+                    print(f"Tüyo kontrolü yanıtlandı: {text} -> chat {msg_chat_id}")
+                    continue
+                else:
+                    reply = f"❌ `{arg}` için NASDAQ verisi bulunamadı."
         elif cmd in ("/analiz", "/grafik", "/fiyat", "/hisse"):
             if not arg:
                 reply = "Kullanım: `/analiz XLAB` veya `/grafik NVDA`"
@@ -578,8 +814,12 @@ def main():
                 state[nid] = now
             print(f"Haber paketi gönderildi: {min(len(fresh_news), 5)} haber")
 
-    # 6) Telegram komutlarını yanıtla (/help, /durum, /analiz, /ekle, /alarm vb.)
+    # 6) Telegram komutlarını yanıtla (/help, /durum, /analiz, /tuyo, /karne, /hesap, /ekle, /alarm vb.)
     process_telegram_commands(state, setups, market_open, market_status, regime, paper_trader_mod=paper_trader_mod)
+
+    # 7) GitHub Pages Mobil Web / Telegram Mini App için canlı dashboard_data.json üret
+    if setups:
+        export_dashboard_json(setups, market_open, market_status, regime, paper_trader_mod=paper_trader_mod)
 
     # Eski kayıtları temizle (3 günden eski), kalıcı anahtarları KORU!
     keep_keys = {"tg_offset", "top_picks_ts", "watchlist", "alerts"}
