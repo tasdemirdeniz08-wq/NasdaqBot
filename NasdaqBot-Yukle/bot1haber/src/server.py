@@ -1467,9 +1467,9 @@ SECTOR_MAP = {}
 LAST_DF_CACHE = {}
 REGIME_CACHE = {"data": None, "ts": 0}
 
-MIN_DAYTRADE_PRICE = float(os.getenv("MIN_STOCK_PRICE", "3.0"))
-MIN_DOLLAR_VOL = float(os.getenv("MIN_DOLLAR_VOL", "2000000"))
-MAX_CHASE_PCT = float(os.getenv("MAX_CHASE_PCT", "30.0"))
+MIN_DAYTRADE_PRICE = float(os.getenv("MIN_STOCK_PRICE", "2.0"))
+MIN_DOLLAR_VOL = float(os.getenv("MIN_DOLLAR_VOL", "1000000"))
+MAX_CHASE_PCT = float(os.getenv("MAX_CHASE_PCT", "45.0"))
 
 
 def is_us_market_open():
@@ -1828,7 +1828,12 @@ def _compute_setup_from_df(df, meta):
         score += 7; confirmations += 1
     if macd_bull:
         score += 14; confirmations += 1; reasons.append("MACD pozitif")
-    if 44 <= rsi <= 68:
+    oversold_bounce = False
+    prev_rsi = float(rsi_series.iloc[-2]) if len(rsi_series) >= 2 and not np.isnan(rsi_series.iloc[-2]) else rsi
+    if (prev_rsi < 33 or rsi < 35) and change_pct >= 1.0 and vol_ratio >= 1.0:
+        oversold_bounce = True
+        score += 18; confirmations += 1; reasons.append(f"🔄 Aşırı satım tepki dönüşü (RSI {prev_rsi:.0f}→{rsi:.0f}, +%{change_pct:.1f})")
+    elif 44 <= rsi <= 68:
         score += 14; confirmations += 1; reasons.append(f"RSI ideal ({rsi:.0f})")
     elif 35 <= rsi < 44:
         score += 10; reasons.append(f"RSI destek bölgesinde ({rsi:.0f})")
@@ -1885,6 +1890,7 @@ def _compute_setup_from_df(df, meta):
         "price": _fmt_price(price), "change": round(change_pct, 2), "rsi": round(rsi, 1),
         "vol_ratio": round(vol_ratio, 2), "atr_pct": round(atr_pct, 2),
         "dollar_vol": round(avg_dollar_vol, 0), "tradeable": tradeable,
+        "oversold_bounce": oversold_bounce,
         "confirmations": confirmations, "score": score,
         "is_sniper": is_sniper, "decision": decision, "decision_type": decision_type,
         "breakout": _fmt_price(breakout), "breakout_dist_pct": round(dist_to_breakout, 2),
@@ -2076,8 +2082,8 @@ def _analyze_options_flow(symbol):
         return None
 
 
-def _compute_intraday_vwap(symbol):
-    """Son 15 dakikalık gün içi (+ pre/after-hours) mumlardan güncel günün VWAP seviyesini hesaplar."""
+def _compute_intraday_signals(symbol):
+    """Son 15 dakikalık gün içi (+ pre/after-hours) mumlardan VWAP ve 30 dk Açılış Kırılımı (ORB) hesaplar."""
     try:
         import yfinance as yf
         df = yf.download(symbol, period="5d", interval="15m", prepost=True, progress=False, auto_adjust=False, threads=False)
@@ -2090,11 +2096,25 @@ def _compute_intraday_vwap(symbol):
         if day_df.empty:
             day_df = df.tail(26)
         vol = day_df["Volume"].astype(float)
-        if float(vol.sum()) <= 0:
-            return None
-        tp = (day_df["High"].astype(float) + day_df["Low"].astype(float) + day_df["Close"].astype(float)) / 3.0
-        vwap = float((tp * vol).sum() / vol.sum())
-        return _fmt_price(vwap) if vwap > 0 else None
+        vwap = None
+        if float(vol.sum()) > 0:
+            tp = (day_df["High"].astype(float) + day_df["Low"].astype(float) + day_df["Close"].astype(float)) / 3.0
+            v_val = float((tp * vol).sum() / vol.sum())
+            if v_val > 0:
+                vwap = _fmt_price(v_val)
+
+        # ORB (Opening Range Breakout): günün ilk 2 adet 15 dk mumunun (30 dk) en yükseğini kırma
+        orb_high = None
+        orb_breakout = False
+        if len(day_df) >= 3:
+            first_2 = day_df.iloc[:2]
+            orb_h = float(first_2["High"].astype(float).max())
+            cur_c = float(day_df["Close"].astype(float).iloc[-1])
+            if orb_h > 0:
+                orb_high = _fmt_price(orb_h)
+                orb_breakout = cur_c > orb_h * 1.002
+
+        return {"vwap": vwap, "orb_high": orb_high, "orb_breakout": orb_breakout}
     except Exception:
         return None
 
@@ -2149,16 +2169,23 @@ def _enrich_with_options_and_news(setups, top_n=15):
             s["score"] = max(5, min(98, s["score"] + opt["score_delta"]))
             extra_notes.append(opt["summary"])
 
-        # 2) Gün içi 15m VWAP teyidi (günlük al-sat için)
-        vwap = _compute_intraday_vwap(sym)
-        if vwap:
-            s["vwap"] = vwap
-            if s["price"] >= vwap:
-                s["score"] = min(98, s["score"] + 5)
-                extra_notes.append(f"VWAP üstünde (${vwap})")
-            else:
-                s["score"] = max(5, s["score"] - 4)
-                extra_notes.append(f"VWAP altında (${vwap})")
+        # 2) Gün içi 15m VWAP + 30 dk Açılış Kırılımı (ORB) teyidi
+        intra = _compute_intraday_signals(sym)
+        if intra:
+            vwap = intra.get("vwap")
+            if vwap:
+                s["vwap"] = vwap
+                if s["price"] >= vwap:
+                    s["score"] = min(98, s["score"] + 5)
+                    extra_notes.append(f"VWAP üstünde (${vwap})")
+                else:
+                    s["score"] = max(5, s["score"] - 4)
+                    extra_notes.append(f"VWAP altında (${vwap})")
+            if intra.get("orb_breakout"):
+                s["orb_breakout"] = True
+                s["orb_high"] = intra.get("orb_high")
+                s["score"] = min(98, s["score"] + 8)
+                extra_notes.append(f"🚀 ORB kırılımı (>${intra.get('orb_high')})")
 
         # 3) Yakın bilanço (earnings) gap koruması
         if _has_upcoming_earnings(sym, days_ahead=2):

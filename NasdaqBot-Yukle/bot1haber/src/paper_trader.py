@@ -14,20 +14,21 @@ from datetime import datetime, timezone
 # ---------------- AYARLAR (GÜNLÜK AL-SAT + GERÇEKÇİ KOMİSYON) ----------------
 INITIAL_CAPITAL = float(os.getenv("PAPER_CAPITAL", "1500"))
 MIN_SCORE = int(os.getenv("PAPER_MIN_SCORE", "65"))          # Giriş için minimum güven puanı
-MAX_OPEN = int(os.getenv("PAPER_MAX_POSITIONS", "8"))        # Aynı anda en fazla pozisyon + bekleyen plan
-MAX_PER_CATEGORY = int(os.getenv("PAPER_MAX_PER_CATEGORY", "8"))
+MAX_OPEN = int(os.getenv("PAPER_MAX_POSITIONS", "5"))        # 5 güçlü hisseye odaklan (komisyon yükünü azaltır)
+MAX_PER_CATEGORY = int(os.getenv("PAPER_MAX_PER_CATEGORY", "5"))
 MAX_PER_SECTOR = int(os.getenv("PAPER_MAX_PER_SECTOR", "2")) # Aynı sektörden en fazla 2 hisse
-RISK_PER_TRADE = float(os.getenv("PAPER_RISK_PER_TRADE", "0.035"))  # İşlem başına %3.5 risk
-MAX_POSITION_FRAC = float(os.getenv("PAPER_MAX_POS_FRAC", "0.22"))  # Tek pozisyon en fazla sermayenin %22'si
-MAX_EXPOSURE_FRAC = float(os.getenv("PAPER_MAX_EXPOSURE", "0.98"))  # Sermayenin %98'ine kadar aktif kullanım
+RISK_PER_TRADE = float(os.getenv("PAPER_RISK_PER_TRADE", "0.04"))   # İşlem başına %4 risk
+MAX_POSITION_FRAC = float(os.getenv("PAPER_MAX_POS_FRAC", "0.28"))  # Tek pozisyon en fazla sermayenin %28'i (~$350-$420)
+MAX_EXPOSURE_FRAC = float(os.getenv("PAPER_MAX_EXPOSURE", "1.00"))  # Sermayenin %100'üne kadar aktif kullanım (sınırsız)
 COMMISSION_PER_ORDER = float(os.getenv("PAPER_COMMISSION_USD", "1.50"))  # Alış/satış başına sabit aracı kurum komisyonu ($1.50 — örn. Midas)
 FEE = float(os.getenv("PAPER_FEE_RATE", "0.0005"))           # %0.05 borsa/SEC kesintisi
 SLIP = float(os.getenv("PAPER_SLIP_RATE", "0.0007"))         # %0.07 spread/kayma
-TIER_SPLIT = (0.60, 0.25, 0.15)  # %60 anlık piyasa girişi, %25 geri çekilme, %15 kırılım onayı
-PLAN_TTL_CRYPTO = 2 * 86400
-PLAN_TTL_DEFAULT = 2 * 86400
-MAX_HOLD = int(os.getenv("PAPER_MAX_HOLD_DAYS", "3")) * 86400  # Günlük/kısa vade: en fazla 3 gün elde tutma
-COOLDOWN_AFTER_CLOSE = 18 * 3600
+TIER_SPLIT = (1.00,)             # Tek temiz anlık giriş (emir bölüp 3x komisyon ödememek için)
+PEAK_TRAIL_PCT = float(os.getenv("PAPER_PEAK_TRAIL", "0.035"))  # TP1 sonrası zirveden %3.5 izleyen stop (kârı koştur)
+PLAN_TTL_CRYPTO = 1 * 86400
+PLAN_TTL_DEFAULT = 1 * 86400     # Günlük al-sat: 24 saatte dolmayan bekleyen planlar iptal edilip nakit serbest kalır
+MAX_HOLD = int(os.getenv("PAPER_MAX_HOLD_DAYS", "15")) * 86400  # Backtest verisi: 3 gün yerine 15 gün tutma kazanma oranını %24'ten %55+'e çıkarıyor
+COOLDOWN_AFTER_CLOSE = 12 * 3600
 DAILY_MAX_LOSS_FRAC = float(os.getenv("PAPER_DAILY_MAX_LOSS", "0.04"))  # Günlük -%4 zarar devre kesici
 TRAIL_TRIGGER_PCT = float(os.getenv("PAPER_TRAIL_TRIGGER", "0.04"))     # +%4 kârda izleyen stop devreye girer
 TRAIL_LOCK_PCT = float(os.getenv("PAPER_TRAIL_LOCK", "0.01"))           # Stop en az +%1 kâra kilitlenir
@@ -233,14 +234,20 @@ def _manage_positions(st, prices, fx, now, events):
             _close_position(st, pos, p, fx, reason, now, events)
             continue
 
-        # 2) Zaman stopu
-        if now - pos["opened"] > MAX_HOLD:
+        # 2) Zaman stopu (sadece yatay/zararda kalan işlemlerde; kârdaki trendi kesme!)
+        avg_e = pos.get("avg_entry", 0)
+        if now - pos["opened"] > MAX_HOLD and (avg_e <= 0 or p < avg_e * 1.02):
             _close_position(st, pos, p, fx, f"ZAMAN STOPU ({MAX_HOLD // 86400} gün)", now, events)
             continue
 
-        # 2b) Dinamik İzleyen Stop (Kâr Kilidi: +%4 kârda stopu +%1 kâra çek)
-        avg_e = pos.get("avg_entry", 0)
-        if avg_e > 0 and p >= avg_e * (1.0 + TRAIL_TRIGGER_PCT):
+        # 2b) Zirve takibi + Dinamik İzleyen Stop
+        pos["peak_price"] = max(pos.get("peak_price", p), p)
+        if pos["tp_hit"] >= 1:
+            # TP1 sonrası kalan %50'yi zirveden %3.5 izleyen stopla koştur (büyük trendleri yakala!)
+            trail_stop = pos["peak_price"] * (1.0 - PEAK_TRAIL_PCT)
+            if trail_stop > pos["stop"]:
+                pos["stop"] = trail_stop
+        elif avg_e > 0 and p >= avg_e * (1.0 + TRAIL_TRIGGER_PCT):
             lock_stop = avg_e * (1.0 + TRAIL_LOCK_PCT)
             if lock_stop > pos["stop"]:
                 pos["stop"] = lock_stop
@@ -251,38 +258,31 @@ def _manage_positions(st, prices, fx, now, events):
                 )
                 _log(st, f"KÂR KİLİDİ {pos['short']} stop -> {lock_stop:.4f}")
 
-        # 3) Kâr al kademeleri
-        while pos["tp_hit"] < 3 and pos["qty"] > 1e-12 and p >= pos[f"tp{pos['tp_hit'] + 1}"]:
-            k = pos["tp_hit"] + 1
-            if k == 1:
-                sell_qty = 0.4 * pos["orig_qty"]
-            elif k == 2:
-                sell_qty = 0.3 * pos["orig_qty"]
-            else:
-                sell_qty = pos["qty"]
+        # 3) Kâr al kademesi (TP1'de %50 sat, kalan %50'yi izleyen stopla koştur — gereksiz komisyon bölünmesi yok!)
+        if pos["tp_hit"] == 0 and pos["qty"] > 1e-12 and p >= pos["tp1"]:
+            sell_qty = 0.50 * pos["orig_qty"]
             usd = _sell(st, pos, sell_qty, p, fx)
-            pos["tp_hit"] = k
-            if k == 1:
-                pos["stop"] = max(pos["stop"], pos["avg_entry"])
-                _cancel_plan_for_symbol(st, pos["symbol"])
-            elif k == 2:
-                pos["stop"] = max(pos["stop"], pos["tp1"])
+            pos["tp_hit"] = 1
+            pos["stop"] = max(pos["stop"], avg_e * 1.01, pos["peak_price"] * (1.0 - PEAK_TRAIL_PCT))
+            _cancel_plan_for_symbol(st, pos["symbol"])
             events.append(
-                f"🎯 *SANAL KÂR AL TP{k} — {pos['short']}*\n"
-                f"Fiyat: `{_fmt(p, cur)}` | Satılan: `{usd:.2f}$` | Yeni stop: `{_fmt(pos['stop'], cur)}`")
-            _log(st, f"TP{k} {pos['short']} @ {p}")
+                f"🎯 *SANAL KÂR AL TP1 (%50) — {pos['short']}*\n"
+                f"Fiyat: `{_fmt(p, cur)}` | Satılan: `{usd:.2f}$` | Kalan %50 izleyen stop: `{_fmt(pos['stop'], cur)}` (zirveden -%{PEAK_TRAIL_PCT*100:.1f})"
+            )
+            _log(st, f"TP1 (%50) {pos['short']} @ {p}")
             if pos["qty"] <= 1e-12:
-                _close_position(st, pos, p, fx, "TP3 (tam çıkış)", now, events)
-                break
+                _close_position(st, pos, p, fx, "TP1 (tam çıkış)", now, events)
 
 
 def _process_plans(st, prices, fx, now, events):
     for plan in list(st["plans"]):
         s = prices.get(plan["symbol"])
-        if now > plan["expires"]:
+        any_filled = any(t.get("filled") for t in plan.get("tiers", []))
+        stale_unfilled = (not any_filled) and (now - plan.get("created", 0) > PLAN_TTL_DEFAULT)
+        if now > plan["expires"] or stale_unfilled:
             _release_plan(st, plan)
-            events.append(f"⌛ Sanal emir süresi doldu (dolmadı): *{plan['short']}*")
-            _log(st, f"PLAN SÜRESİ DOLDU {plan['short']}")
+            events.append(f"⌛ Bekleyen eski plan iptal edildi (nakit serbest): *{plan['short']}*")
+            _log(st, f"PLAN İPTAL (SÜRE) {plan['short']}")
             continue
         if not s:
             continue
@@ -341,8 +341,9 @@ def _process_plans(st, prices, fx, now, events):
             t["filled"] = True
             plan["reserved"] -= usd
             tier_no = plan["tiers"].index(t) + 1
+            total_tiers = len(plan["tiers"])
             events.append(
-                f"📥 *SANAL ALIŞ — {plan['short']}* (Kademe {tier_no}/3)\n"
+                f"📥 *SANAL ALIŞ — {plan['short']}* (Kademe {tier_no}/{total_tiers})\n"
                 f"Fiyat: `{_fmt(fill_price, cur)}` | Tutar: `{usd:.2f}$` (💸 Komisyon: `-{total_cost_fee:.2f}$`)\n"
                 f"Stop: `{_fmt(plan['stop'], cur)}` | TP1 `{_fmt(plan['tp1'], cur)}`")
             _log(st, f"ALIŞ {plan['short']} kademe {tier_no} @ {fill_price:.4f} ({usd:.2f}$, kom -{total_cost_fee:.2f}$)")
@@ -369,12 +370,12 @@ def _create_plans(st, setups, fx, now, events, regime_scale=1.0):
         if sec and sec != "Diğer":
             sec_count[sec] = sec_count.get(sec, 0) + 1
 
-    eff_exposure_cap = equity * MAX_EXPOSURE_FRAC * max(0.4, min(1.0, regime_scale))
+    eff_exposure_cap = equity * MAX_EXPOSURE_FRAC
     cands = sorted([s for s in setups if s["score"] >= MIN_SCORE], key=lambda x: -x["score"])
     for s in cands:
         if slots >= MAX_OPEN:
             break
-        # Ucuz hisse (<$3), düşük hacim (<$2M), aşırı yükselmiş (>+%30 FOMO) veya yakın bilanço riski olanlara otomatik girme
+        # Ucuz hisse (<$2), düşük hacim (<$1M), aşırı yükselmiş (>+%45 FOMO) veya yakın bilanço riski olanlara otomatik girme
         if s.get("tradeable") is False or s.get("earnings_warning") is True:
             continue
         sym = s["symbol"]
@@ -396,14 +397,14 @@ def _create_plans(st, setups, fx, now, events, regime_scale=1.0):
         price = s["price"]
         if not (0 < stop < e2 < e1 < price < eb):
             continue
-        avg_full = TIER_SPLIT[0] * price + TIER_SPLIT[1] * e1 + TIER_SPLIT[2] * eb
+        avg_full = price
         stop_frac = (avg_full - stop) / avg_full
-        if not (0.01 <= stop_frac <= 0.15):
+        if not (0.01 <= stop_frac <= 0.20):
             continue
 
-        budget = min(equity * MAX_POSITION_FRAC, equity * RISK_PER_TRADE / stop_frac) * max(0.5, min(1.0, regime_scale))
+        budget = min(equity * MAX_POSITION_FRAC, equity * RISK_PER_TRADE / stop_frac)
         budget = min(budget, st["cash"], eff_exposure_cap - exposure)
-        if budget < 60:
+        if budget < 80:
             continue
 
         st["seq"] += 1
@@ -416,9 +417,7 @@ def _create_plans(st, setups, fx, now, events, regime_scale=1.0):
             "stop": stop, "tp1": s["tp1"], "tp2": s["tp2"], "tp3": s["tp3"],
             "reserved": round(budget, 4), "budget": round(budget, 2),
             "tiers": [
-                {"kind": "market", "price": price, "usd": round(budget * TIER_SPLIT[0], 4), "filled": False},
-                {"kind": "limit", "price": e1, "usd": round(budget * TIER_SPLIT[1], 4), "filled": False},
-                {"kind": "breakout", "price": eb, "usd": round(budget * TIER_SPLIT[2], 4), "filled": False},
+                {"kind": "market", "price": price, "usd": round(budget, 4), "filled": False},
             ],
         }
         plan["reserved"] = round(sum(t["usd"] for t in plan["tiers"]), 4)
@@ -430,6 +429,8 @@ def _create_plans(st, setups, fx, now, events, regime_scale=1.0):
         if sec != "Diğer":
             sec_count[sec] = sec_count.get(sec, 0) + 1
         extra_lines = []
+        if s.get("orb_breakout"):
+            extra_lines.append(f"🚀 ORB Açılış Kırılımı (>${s.get('orb_high')})")
         if s.get("options") and s["options"].get("summary"):
             extra_lines.append(f"📊 {s['options']['summary']}")
         if s.get("latest_news"):
@@ -437,11 +438,10 @@ def _create_plans(st, setups, fx, now, events, regime_scale=1.0):
             extra_lines.append(f"📰 {nb}: _{s['latest_news'][:90]}_")
         extra_txt = ("\n" + "\n".join(extra_lines)) if extra_lines else ""
         events.append(
-            f"📝 *YENİ AGRESİF SANAL PLAN — {s['short']}* ({s['category']} · Skor {s['score']}/100)\n"
-            f"Fiyat: `{_fmt(price, cur)}` | Bütçe: `{budget:.2f}$`\n"
-            f"⚡ Anlık Giriş (%60): `{_fmt(price, cur)}` | Destek (%25): `{_fmt(e1, cur)}` | Kırılım (%15): `{_fmt(eb, cur)}`\n"
-            f"🛑 Stop: `{_fmt(stop, cur)}` (-%{stop_frac * 100:.1f}) | 🎯 TP1 `{_fmt(s['tp1'], cur)}` TP2 `{_fmt(s['tp2'], cur)}` TP3 `{_fmt(s['tp3'], cur)}`{extra_txt}")
-        _log(st, f"PLAN {s['short']} skor {s['score']} bütçe {budget:.0f}$ (agresif)")
+            f"📝 *YENİ GÜNLÜK AL-SAT GİRİŞİ — {s['short']}* ({sec} · Skor {s['score']}/100)\n"
+            f"Fiyat: `{_fmt(price, cur)}` | Bütçe: `{budget:.2f}$` (Tek temiz emir · -1.50$ komisyon)\n"
+            f"🛑 Stop: `{_fmt(stop, cur)}` (-%{stop_frac * 100:.1f}) | 🎯 TP1 (%50) `{_fmt(s['tp1'], cur)}` | Kalan %50: Zirveden -%3.5 İzleyen Stop{extra_txt}")
+        _log(st, f"PLAN {s['short']} skor {s['score']} bütçe {budget:.0f}$ (tek emir)")
 
 
 # ---------------- İSTATİSTİK ----------------
@@ -582,13 +582,14 @@ def _summary_text(st, fx, weekly=False):
             )
 
     if st["plans"]:
-        lines.append("\n📝 *Bekleyen Emir Planları (Kademeler & Kırılım):*")
+        lines.append("\n📝 *Bekleyen Emir Planları:*")
         for pl in st["plans"]:
             c = pl["currency"]
-            t1, t2, t3 = pl["tiers"][0], pl["tiers"][1], pl["tiers"][2]
+            tiers = pl.get("tiers", [])
+            t_str = " | ".join(f"{t['kind'].upper()} `{_fmt(t['price'], c)}`" for t in tiers)
             lines.append(
                 f"• *{pl['short']}* ({pl['category']} · Skor {pl['score']}/100 · `{pl['budget']:.0f}$`)\n"
-                f"  📥 K1 `{_fmt(t1['price'], c)}` | K2 `{_fmt(t2['price'], c)}` | ⚡ Kırılım `{_fmt(t3['price'], c)}` | 🛑 Stop `{_fmt(pl['stop'], c)}`"
+                f"  📥 {t_str} | 🛑 Stop `{_fmt(pl['stop'], c)}`"
             )
 
     window_sec = 7 * 86400 if weekly else 86400

@@ -227,6 +227,10 @@ def build_15min_bulletin(setups, market_open, market_status, regime, paper_summa
         c = s["currency"]
         vwap_s = f" | VWAP `{c}{s['vwap']}`" if s.get("vwap") else ""
         badges = []
+        if s.get("orb_breakout"):
+            badges.append("🚀ORB")
+        if s.get("oversold_bounce"):
+            badges.append("🔄Dönüş")
         if s.get("squeeze_candidate"):
             badges.append(f"🔥Squeeze %{s.get('short_float_pct')}")
         if (s.get("options") or {}).get("unusual"):
