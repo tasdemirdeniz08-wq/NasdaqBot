@@ -338,6 +338,10 @@ def export_dashboard_json(setups, market_open, market_status, regime, paper_trad
                 "short_float_pct": s.get("short_float_pct"),
                 "earnings_warning": bool(s.get("earnings_warning")),
                 "tradeable": bool(s.get("tradeable", True)),
+                "analyst_target": s.get("analyst_target"),
+                "analyst_upside_pct": s.get("analyst_upside_pct"),
+                "analyst_count": s.get("analyst_count", 0),
+                "inst_pct": s.get("inst_pct"),
                 "horizons": s.get("horizons", {}),
                 "options": (s.get("options") or {}).get("summary", ""),
                 "unusual_opt": bool((s.get("options") or {}).get("unusual")),
@@ -354,6 +358,7 @@ def export_dashboard_json(setups, market_open, market_status, regime, paper_trad
             "total_universe": server.LIVE_MOVERS_CACHE.get("total_universe", 0) or len(setups),
             "scanned_count": len(setups),
             "radar": radar,
+            "macro": server.get_macro_calendar(),
             "rockets": rockets,
             "movers": server.get_live_nasdaq_movers(limit=10),
             "gappers": server.get_premarket_gappers(limit=10),
@@ -391,7 +396,13 @@ def build_15min_bulletin(setups, market_open, market_status, regime, paper_summa
     total_u = server.LIVE_MOVERS_CACHE.get("total_universe", 0) or len(setups)
     vix_s = f" | VIX: `{regime['vix']}`" if regime.get("vix") else ""
     radar = server.get_market_radar()
+    macro = server.get_macro_calendar()
     radar_lines = []
+    if macro.get("high_vol_alert"):
+        radar_lines.append(f"*{macro['alert_text']}*")
+    elif macro.get("next_event"):
+        ne = macro["next_event"]
+        radar_lines.append(f"📅 Yaklaşan ABD Makro: `{ne['title']}` ({ne['time_tr']})")
     if radar.get("advancing") or radar.get("declining"):
         radar_lines.append(f"📡 Piyasa Genişliği: `🟢 {radar['advancing']:,}` Yükselen / `🔴 {radar['declining']:,}` Düşen")
     if radar.get("top_sectors"):
@@ -422,6 +433,8 @@ def build_15min_bulletin(setups, market_open, market_status, regime, paper_summa
             badges.append(f"🔥Squeeze %{s.get('short_float_pct')}")
         if (s.get("options") or {}).get("unusual"):
             badges.append("⚡Olağandışı CALL")
+        if s.get("analyst_target") and (s.get("analyst_upside_pct") or 0) >= 15:
+            badges.append(f"🏦WS+{s['analyst_upside_pct']:.0f}%")
         badge_s = (" · " + " ".join(badges)) if badges else ""
         hz = s.get("horizons") or {}
         hz_s = f" | 3V: G`{hz.get('gunluk',{}).get('score','-')}`/2-3G`{hz.get('swing_2_3',{}).get('score','-')}`/H`{hz.get('haftalik',{}).get('score','-')}`" if hz else ""

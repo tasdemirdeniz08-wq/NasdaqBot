@@ -210,6 +210,11 @@
       <div class="sector-row" id="sectorRow"></div>
     </div>
 
+    <div class="card" id="macroCard" style="display:none">
+      <div class="card-title"><span>📅 ABD Makro Takvim (Fed / CPI / NFP)</span><span id="macroBadge" class="gold">Kritik Veri</span></div>
+      <div id="macroList"></div>
+    </div>
+
     <div class="card">
       <div class="card-title"><span>🚀 Günün En Güçlü 3 Roketi</span><span class="blue" style="cursor:pointer" onclick="switchTab('rockets')">Tümü →</span></div>
       <div id="radarTop3"></div>
@@ -256,6 +261,7 @@
     <div class="card">
       <div class="card-title"><span>💼 1500$ Sanal Portföy (Net)</span></div>
       <div class="kpi-grid" id="portKpis"></div>
+      <div id="equityChartWrap" style="margin-top:12px"></div>
     </div>
     <div class="card">
       <div class="card-title"><span>🟢 Açık Pozisyonlar</span></div>
@@ -346,6 +352,8 @@ function rocketCardHTML(s) {
   if (s.rs_leader) tags.push('💪 RS +' + s.rs_vs_ndx + '%');
   if (s.squeeze_candidate) tags.push('🔥 Squeeze %' + (s.short_float_pct||''));
   if (s.unusual_opt) tags.push('⚡ Olağandışı CALL');
+  if (s.analyst_target && (s.analyst_upside_pct||0) >= 15) tags.push('🏦 WS +' + s.analyst_upside_pct.toFixed(0) + '%');
+  if (s.inst_pct && s.inst_pct >= 50) tags.push('🏛️ Kurumsal %' + Math.round(s.inst_pct));
   return `
     <div class="rocket" onclick="openDetail('${s.short}')">
       <div class="r-top">
@@ -391,6 +399,27 @@ function renderAll() {
   document.getElementById('sectorRow').innerHTML = secs.map(([sc, chg]) =>
     `<div class="sector-chip">🏭 ${sc} <span class="${chg>=0?'green':'red'}">${chg>=0?'+':''}${chg}%</span></div>`
   ).join('');
+
+  // Makro Takvim Kartı
+  const mac = DATA.macro || {};
+  const macCard = document.getElementById('macroCard');
+  if (mac.events && mac.events.length) {
+    macCard.style.display = 'block';
+    const bdg = document.getElementById('macroBadge');
+    if (mac.high_vol_alert) {
+      bdg.textContent = '⚠️ YÜKSEK VOLATİLİTE';
+      bdg.className = 'red';
+      macCard.style.borderColor = 'rgba(244,63,94,0.6)';
+    } else {
+      bdg.textContent = 'Bu Hafta (USD)';
+      bdg.className = 'gold';
+    }
+    document.getElementById('macroList').innerHTML = mac.events.slice(0, 3).map(ev =>
+      `<div class="row-item"><div><b>${ev.title}</b><br><small style="color:var(--muted)">Beklenti: ${ev.forecast} · Önceki: ${ev.previous}</small></div><span class="blue" style="font-size:12px;font-weight:700">${ev.time_tr}</span></div>`
+    ).join('');
+  } else {
+    macCard.style.display = 'none';
+  }
 
   const rockets = DATA.rockets || [];
   document.getElementById('radarTop3').innerHTML = rockets.slice(0, 3).map(rocketCardHTML).join('') || '<div class="empty">Veri bekleniyor...</div>';
@@ -450,6 +479,7 @@ function renderKarneAndPortfolio() {
     <div class="kpi"><div class="lbl">Toplam Varlık</div><div class="val">$${p.equity.toFixed(2)}</div><div class="sub ${retCls}">${p.return_pct>=0?'+':''}${p.return_pct}% net</div></div>
     <div class="kpi"><div class="lbl">Serbest Nakit</div><div class="val blue">$${p.cash.toFixed(2)}</div><div class="sub">Rezerve: $${p.reserved.toFixed(2)}</div></div>
   `;
+  renderEquityCurve(p.equity_curve || [], p.initial || 1500);
   const openPos = p.positions || [];
   document.getElementById('portOpen').innerHTML = openPos.map(pos =>
     `<div class="row-item">
@@ -457,6 +487,47 @@ function renderKarneAndPortfolio() {
       <div class="${pos.pnl_usd>=0?'green':'red'}" style="text-align:right;font-weight:800">${pos.pnl_usd>=0?'+':''}$${pos.pnl_usd.toFixed(2)}<br><small>${pos.pnl_pct>=0?'+':''}${pos.pnl_pct}%</small></div>
     </div>`
   ).join('') || '<div class="empty">Şu an açık pozisyon yok.</div>';
+}
+
+function renderEquityCurve(curve, initial) {
+  const wrap = document.getElementById('equityChartWrap');
+  if (!curve || curve.length < 2) {
+    wrap.innerHTML = '<div style="text-align:center;color:var(--muted);font-size:11.5px;padding:8px">Sermaye eğrisi verisi birikiyor...</div>';
+    return;
+  }
+  const vals = curve.map(pt => Number(pt[1]));
+  const minV = Math.min(...vals, initial) * 0.996;
+  const maxV = Math.max(...vals, initial) * 1.004;
+  const span = Math.max(1, maxV - minV);
+  const W = 440, H = 125, pad = 10;
+  const pts = vals.map((v, i) => {
+    const x = pad + (i / (vals.length - 1)) * (W - 2 * pad);
+    const y = H - pad - ((v - minV) / span) * (H - 2 * pad);
+    return [x, y];
+  });
+  const lineD = pts.map((p, i) => (i === 0 ? 'M' : 'L') + p[0].toFixed(1) + ',' + p[1].toFixed(1)).join(' ');
+  const areaD = `${lineD} L${pts[pts.length-1][0].toFixed(1)},${H-pad} L${pts[0][0].toFixed(1)},${H-pad} Z`;
+  const baseY = H - pad - ((initial - minV) / span) * (H - 2 * pad);
+  const lastV = vals[vals.length - 1];
+  const col = lastV >= initial ? '#10b981' : '#f43f5e';
+  const lastPt = pts[pts.length - 1];
+  wrap.innerHTML = `
+    <div style="font-size:11px;color:var(--muted);margin-bottom:4px;display:flex;justify-content:space-between">
+      <span>📈 Sermaye Eğrisi (Başlangıç $${initial})</span>
+      <b style="color:${col}">$${lastV.toFixed(2)}</b>
+    </div>
+    <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:125px;background:var(--card2);border-radius:12px;border:1px solid var(--border)">
+      <defs>
+        <linearGradient id="eqGrad" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="${col}" stop-opacity="0.35"/>
+          <stop offset="100%" stop-color="${col}" stop-opacity="0.02"/>
+        </linearGradient>
+      </defs>
+      <line x1="${pad}" y1="${baseY.toFixed(1)}" x2="${W-pad}" y2="${baseY.toFixed(1)}" stroke="#475569" stroke-dasharray="4 4" stroke-width="1"/>
+      <path d="${areaD}" fill="url(#eqGrad)"/>
+      <path d="${lineD}" fill="none" stroke="${col}" stroke-width="2.3" stroke-linecap="round"/>
+      <circle cx="${lastPt[0].toFixed(1)}" cy="${lastPt[1].toFixed(1)}" r="4.2" fill="${col}" stroke="#fff" stroke-width="1.4"/>
+    </svg>`;
 }
 
 function openDetail(sym) {
@@ -472,6 +543,7 @@ function openDetail(sym) {
     <span>🚀 TP2 <b class="blue">$${fmt(s.tp2)}</b></span>
   `;
   document.getElementById('mExtra').innerHTML =
+    (s.analyst_target ? `<div>🏦 Wall Street Hedefi: <b class="${(s.analyst_upside_pct||0)>=0?'green':'red'}">$${fmt(s.analyst_target)} (${s.analyst_upside_pct>=0?'+':''}${s.analyst_upside_pct}%)</b>${s.inst_pct ? ' · Kurumsal: %'+s.inst_pct : ''}</div>` : '') +
     (s.options ? `<div>📊 ${s.options}</div>` : '') +
     (s.latest_news ? `<div>📰 ${s.latest_news}</div>` : '') +
     (s.summary ? `<div style="margin-top:4px">🧠 ${s.summary}</div>` : '');

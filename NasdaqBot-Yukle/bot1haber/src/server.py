@@ -1464,6 +1464,7 @@ SNIPER_MIN_SCORE = 90
 US500_CACHE = {"assets": None, "ts": 0}
 LIVE_MOVERS_CACHE = {"movers": [], "total_universe": 0, "ts": 0}
 MARKET_RADAR_CACHE = {"advancing": 0, "declining": 0, "unchanged": 0, "top_sectors": [], "ts": 0}
+MACRO_CACHE = {"data": None, "ts": 0}
 SECTOR_MAP = {}
 LAST_DF_CACHE = {}
 REGIME_CACHE = {"data": None, "ts": 0}
@@ -1609,6 +1610,57 @@ def get_premarket_gappers(limit=8):
 def get_market_radar():
     """4.300+ NASDAQ hissesinden yükselen/düşen dengesi ve lider sektörleri döndürür."""
     return dict(MARKET_RADAR_CACHE)
+
+
+def get_macro_calendar():
+    """Bu haftaki kritik ABD (USD High-Impact: Fed/FOMC, CPI, NFP, PCE, GDP) makro verilerini çeker (1 saat önbellekli)."""
+    now = time.time()
+    if MACRO_CACHE["data"] and (now - MACRO_CACHE["ts"] < 3600):
+        return MACRO_CACHE["data"]
+    result = {"events": [], "next_event": None, "high_vol_alert": False, "alert_text": ""}
+    try:
+        import requests
+        from datetime import timezone, timedelta
+        r = requests.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=10)
+        if r.status_code == 200:
+            raw = r.json() or []
+            tr_tz = timezone(timedelta(hours=3))
+            now_utc = datetime.now(timezone.utc)
+            upcoming = []
+            for ev in raw:
+                if ev.get("country") != "USD" or ev.get("impact") != "High":
+                    continue
+                dt_str = ev.get("date", "")
+                if not dt_str:
+                    continue
+                try:
+                    dt = datetime.fromisoformat(dt_str)
+                    dt_utc = dt.astimezone(timezone.utc)
+                    diff_min = (dt_utc - now_utc).total_seconds() / 60.0
+                    if diff_min < -90:
+                        continue
+                    tr_s = dt_utc.astimezone(tr_tz).strftime("%d.%m %H:%M TR")
+                    item = {
+                        "title": str(ev.get("title", "ABD Makro")),
+                        "time_tr": tr_s,
+                        "diff_min": int(diff_min),
+                        "forecast": str(ev.get("forecast", "") or "-"),
+                        "previous": str(ev.get("previous", "") or "-"),
+                    }
+                    upcoming.append(item)
+                    if -60 <= diff_min <= 120:
+                        result["high_vol_alert"] = True
+                        result["alert_text"] = f"⚠️ YÜKSEK MAKRO VOLATİLİTE: {item['title']} ({tr_s})"
+                except Exception:
+                    continue
+            upcoming.sort(key=lambda x: x["diff_min"])
+            result["events"] = upcoming[:5]
+            result["next_event"] = upcoming[0] if upcoming else None
+            MACRO_CACHE["data"] = result
+            MACRO_CACHE["ts"] = now
+    except Exception as e:
+        print(f"Macro calendar error: {e}")
+    return result
 
 def _get_us_500_assets(extra_symbols=None):
     """
@@ -2278,18 +2330,36 @@ def _enrich_with_options_and_news(setups, top_n=15):
             s["score"] = max(5, s["score"] - 10)
             extra_notes.append("⚠️ Yakın bilanço riski")
 
-        # 3b) Short Squeeze radarı (Short Float >= %15 + yüksek hacim + pozitif hareket)
+        # 3b) Short Squeeze + Wall Street Analist Hedef Fiyatı + Kurumsal Sahiplik (tek info çağrısı)
         try:
-            if s.get("vol_ratio", 1.0) >= 1.5 and s.get("change", 0) > 0:
-                info = yf.Ticker(sym).fast_info if False else (yf.Ticker(sym).info or {})
-                sf = info.get("shortPercentOfFloat")
-                if sf and isinstance(sf, (int, float)):
-                    sf_pct = round(sf * 100.0 if sf <= 1.0 else sf, 1)
-                    s["short_float_pct"] = sf_pct
-                    if sf_pct >= 15.0:
-                        s["squeeze_candidate"] = True
-                        s["score"] = min(98, s["score"] + 6)
-                        extra_notes.append(f"🔥 Short Squeeze adayı (%{sf_pct} Short)")
+            info = yf.Ticker(sym).info or {}
+            # Short Squeeze radarı (Short Float >= %15 + yüksek hacim + pozitif hareket)
+            sf = info.get("shortPercentOfFloat")
+            if sf and isinstance(sf, (int, float)):
+                sf_pct = round(sf * 100.0 if sf <= 1.0 else sf, 1)
+                s["short_float_pct"] = sf_pct
+                if sf_pct >= 15.0 and s.get("vol_ratio", 1.0) >= 1.5 and s.get("change", 0) > 0:
+                    s["squeeze_candidate"] = True
+                    s["score"] = min(98, s["score"] + 6)
+                    extra_notes.append(f"🔥 Short Squeeze adayı (%{sf_pct} Short)")
+
+            # Wall Street Analist Hedef Fiyatı & Potansiyel
+            tgt = info.get("targetMeanPrice")
+            n_an = int(info.get("numberOfAnalystOpinions") or 0)
+            if tgt and isinstance(tgt, (int, float)) and tgt > 0 and s["price"] > 0:
+                upside = round((float(tgt) / float(s["price"]) - 1.0) * 100.0, 1)
+                s["analyst_target"] = _fmt_price(float(tgt))
+                s["analyst_upside_pct"] = upside
+                s["analyst_count"] = n_an
+                if upside >= 15.0 and n_an >= 3:
+                    s["analyst_bull"] = True
+                    s["score"] = min(98, s["score"] + 5)
+                    extra_notes.append(f"🏦 WS Hedef ${s['analyst_target']} (+%{upside})")
+
+            # Kurumsal Sahiplik (%)
+            inst = info.get("heldPercentInstitutions")
+            if inst and isinstance(inst, (int, float)):
+                s["inst_pct"] = round(inst * 100.0 if inst <= 1.0 else inst, 1)
         except Exception:
             pass
 
